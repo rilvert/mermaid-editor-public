@@ -37,4 +37,4 @@ Andere Typen (Gantt, Pie, Mindmap, Timeline …) werden über den Text zugeordne
 - Oberfläche: `src/` → gebündelt nach `public/dist/`
 - Mac-App: `native/main.swift` (WKWebView, Dateizugriff, Menüs, Dialoge)
 - Neu bauen: `npm run app` (braucht Node für das Bündeln und die Xcode Command Line Tools)
-- `npm run dev` startet dieselbe Oberfläche zum Debuggen im Browser (`server.js`)
+- `npm run dev` startet dieselbe Oberfläche zum Debuggen auf `127.0.0.1`. Für den Dateizugriff gib beim Start eine Datei oder einen Ordner an, etwa mit `npm run dev -- ./docs`. Unter macOS kannst du weitere Dateien und Ordner im Öffnen-Dialog auswählen. Die Freigaben gelten bis zum Neustart des lokalen Servers.

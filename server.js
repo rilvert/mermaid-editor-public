@@ -5,8 +5,8 @@
  *   node server.js [datei.md | ordner] [--port 4777] [--no-open] [--stay]
  *
  * Läuft nur auf 127.0.0.1. Alle API-Aufrufe brauchen ein Token, das beim Start
- * erzeugt und nur in die eigene Seite eingebettet wird. Lesen/Schreiben ist auf
- * Text-Dateitypen beschränkt (.md, .mmd, …).
+ * erzeugt und nur in die eigene Seite eingebettet wird. Zugriff gibt es auf
+ * Dateien und Ordner, die beim Start oder in einem Dialog gewählt wurden.
  */
 'use strict';
 
@@ -39,18 +39,8 @@ for (let i = 0; i < argv.length; i++) {
 
 let initialFile = null;
 let initialDir = null;
-if (target) {
-  try {
-    const st = fs.statSync(target);
-    if (st.isDirectory()) initialDir = target;
-    else { initialFile = target; initialDir = path.dirname(target); }
-  } catch {
-    // Datei existiert noch nicht → wird beim ersten Speichern angelegt
-    if (ALLOWED_EXT.has(path.extname(target).toLowerCase())) {
-      initialFile = target; initialDir = path.dirname(target);
-    }
-  }
-}
+const selectedFiles = new Set();
+const selectedFolders = new Set();
 
 const token = crypto.randomBytes(24).toString('hex');
 
@@ -88,11 +78,84 @@ function readBody(req, limit = 20 * 1024 * 1024) {
   });
 }
 
-function checkPath(p) {
-  if (typeof p !== 'string' || !path.isAbsolute(p)) throw httpError(400, 'Ungültiger Pfad');
-  const norm = path.normalize(p);
-  if (!ALLOWED_EXT.has(path.extname(norm).toLowerCase())) throw httpError(403, 'Dateityp nicht erlaubt');
-  return norm;
+function absolutePath(p) {
+  if (typeof p !== 'string' || !path.isAbsolute(p) || p.includes('\0')) {
+    throw httpError(400, 'Ungültiger Pfad');
+  }
+  return path.normalize(p);
+}
+
+async function resolvePath(p) {
+  try {
+    return await fsp.realpath(p);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    // Bei neuen Dateien muss auch der nächste existierende Ordner aufgelöst sein.
+    const entry = await fsp.lstat(p).catch((e) => {
+      if (e.code !== 'ENOENT') throw e;
+      return null;
+    });
+    if (entry) throw httpError(403, 'Symbolischer Link ohne Ziel');
+    return path.join(await resolvePath(path.dirname(p)), path.basename(p));
+  }
+}
+
+function inside(root, p) {
+  const rel = path.relative(root, p);
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
+}
+
+function inSelectedFolder(p) {
+  return [...selectedFolders].some((folder) => inside(folder, p));
+}
+
+async function documentPath(p) {
+  const requested = absolutePath(p);
+  if (!ALLOWED_EXT.has(path.extname(requested).toLowerCase())) {
+    throw httpError(403, 'Dateityp nicht erlaubt');
+  }
+  const resolved = await resolvePath(requested);
+  if (!ALLOWED_EXT.has(path.extname(resolved).toLowerCase())) {
+    throw httpError(403, 'Dateityp nicht erlaubt');
+  }
+  return resolved;
+}
+
+async function selectFile(p) {
+  const resolved = await documentPath(p);
+  selectedFiles.add(resolved);
+  return resolved;
+}
+
+async function selectFolder(p) {
+  const resolved = await fsp.realpath(absolutePath(p));
+  if (!(await fsp.stat(resolved)).isDirectory()) throw httpError(400, 'Ordner fehlt');
+  selectedFolders.add(resolved);
+  return resolved;
+}
+
+async function checkPath(p) {
+  const resolved = await documentPath(p);
+  if (!selectedFiles.has(resolved) && !inSelectedFolder(resolved)) {
+    throw httpError(403, 'Datei wurde nicht freigegeben');
+  }
+  const entry = await fsp.lstat(resolved).catch((err) => {
+    if (err.code !== 'ENOENT') throw err;
+    return null;
+  });
+  if (entry && !entry.isFile()) throw httpError(403, 'Keine reguläre Datei');
+  return resolved;
+}
+
+async function openRegularFile(p, flags = fs.constants.O_RDONLY) {
+  const handle = await fsp.open(p, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    if (!(await handle.stat()).isFile()) throw httpError(403, 'Keine reguläre Datei');
+    return handle;
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
 }
 
 function httpError(status, message) {
@@ -129,7 +192,7 @@ async function listFiles(dir, maxDepth = 4, maxFiles = 800) {
       const full = path.join(d, e.name);
       if (e.isDirectory()) {
         if (depth < maxDepth) await walk(full, depth + 1);
-      } else if (ALLOWED_EXT.has(path.extname(e.name).toLowerCase()) && path.extname(e.name).toLowerCase() !== '.txt') {
+      } else if (e.isFile() && ALLOWED_EXT.has(path.extname(e.name).toLowerCase()) && path.extname(e.name).toLowerCase() !== '.txt') {
         out.push({ path: full, rel: path.relative(dir, full) });
         if (out.length >= maxFiles) return;
       }
@@ -163,7 +226,7 @@ function watchFor(client, file) {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       try {
-        const st = await fsp.stat(file);
+        const st = await fsp.stat(await checkPath(file));
         client.res.write(`event: change\ndata: ${JSON.stringify({ path: file, mtime: st.mtimeMs })}\n\n`);
       } catch { /* gelöscht/umbenannt */ }
     }, 120);
@@ -185,14 +248,15 @@ async function handleApi(req, res, url) {
   const route = url.pathname.slice('/api/'.length);
 
   if (route === 'events' && req.method === 'GET') {
+    const requested = url.searchParams.get('file');
+    const file = requested ? await checkPath(requested) : null;
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
     res.write(': ok\n\n');
     const client = { res, watched: new Map() };
     clients.add(client);
     clearTimeout(idleTimer);
     const ping = setInterval(() => res.write(': ping\n\n'), 25000);
-    const f = url.searchParams.get('file');
-    if (f) { try { watchFor(client, checkPath(f)); } catch { /* */ } }
+    if (file) watchFor(client, file);
     req.on('close', () => {
       clearInterval(ping);
       for (const [, w] of client.watched) w.close();
@@ -208,7 +272,8 @@ async function handleApi(req, res, url) {
   if (route === 'watch' && req.method === 'POST') {
     const { id, path: p } = JSON.parse(await readBody(req) || '{}');
     const client = [...clients].find((c) => c.id === id);
-    if (client) watchFor(client, p ? checkPath(p) : null);
+    const file = p ? await checkPath(p) : null;
+    if (client && clients.has(client)) watchFor(client, file);
     return send(res, 200, { ok: true });
   }
 
@@ -221,16 +286,21 @@ async function handleApi(req, res, url) {
   }
 
   if (route === 'files') {
-    const dir = url.searchParams.get('dir');
-    if (!dir || !path.isAbsolute(dir)) throw httpError(400, 'Ordner fehlt');
+    const dir = await resolvePath(absolutePath(url.searchParams.get('dir')));
+    if (!inSelectedFolder(dir)) throw httpError(403, 'Ordner wurde nicht freigegeben');
     return send(res, 200, { dir, files: await listFiles(dir) });
   }
 
   if (route === 'file' && req.method === 'GET') {
-    const p = checkPath(url.searchParams.get('path'));
+    const p = await checkPath(url.searchParams.get('path'));
     try {
-      const [content, st] = await Promise.all([fsp.readFile(p, 'utf8'), fsp.stat(p)]);
-      return send(res, 200, { path: p, content, mtime: st.mtimeMs });
+      const handle = await openRegularFile(p);
+      try {
+        const [content, st] = await Promise.all([handle.readFile('utf8'), handle.stat()]);
+        return send(res, 200, { path: p, content, mtime: st.mtimeMs });
+      } finally {
+        await handle.close();
+      }
     } catch (e) {
       if (e.code === 'ENOENT') return send(res, 200, { path: p, content: '', mtime: 0, isNew: true });
       throw e;
@@ -239,23 +309,36 @@ async function handleApi(req, res, url) {
 
   if (route === 'file' && req.method === 'PUT') {
     const body = JSON.parse(await readBody(req));
-    const p = checkPath(body.path);
-    if (body.baseMtime && !body.force) {
-      try {
-        const st = await fsp.stat(p);
-        if (Math.abs(st.mtimeMs - body.baseMtime) > 1) {
-          return send(res, 409, { error: 'conflict', mtime: st.mtimeMs });
-        }
-      } catch { /* neu */ }
-    }
+    if (typeof body.content !== 'string') throw httpError(400, 'Ungültiger Dateiinhalt');
+    const p = await checkPath(body.path);
     await fsp.mkdir(path.dirname(p), { recursive: true });
-    await fsp.writeFile(p, body.content, 'utf8');
-    const st = await fsp.stat(p);
-    return send(res, 200, { path: p, mtime: st.mtimeMs });
+    let created = false;
+    const handle = await openRegularFile(p, fs.constants.O_WRONLY).catch(async (err) => {
+      if (err.code !== 'ENOENT') throw err;
+      try {
+        const newHandle = await openRegularFile(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+        created = true;
+        return newHandle;
+      } catch (createErr) {
+        if (createErr.code !== 'EEXIST') throw createErr;
+        return openRegularFile(p, fs.constants.O_WRONLY);
+      }
+    });
+    try {
+      const st = await handle.stat();
+      if (body.baseMtime && !body.force && !created && Math.abs(st.mtimeMs - body.baseMtime) > 1) {
+        return send(res, 409, { error: 'conflict', mtime: st.mtimeMs });
+      }
+      await handle.writeFile(body.content, 'utf8');
+      await handle.truncate(Buffer.byteLength(body.content));
+      return send(res, 200, { path: p, mtime: (await handle.stat()).mtimeMs });
+    } finally {
+      await handle.close();
+    }
   }
 
   if (route === 'stat') {
-    const p = checkPath(url.searchParams.get('path'));
+    const p = await checkPath(url.searchParams.get('path'));
     try { const st = await fsp.stat(p); return send(res, 200, { mtime: st.mtimeMs }); }
     catch { return send(res, 200, { mtime: 0, missing: true }); }
   }
@@ -267,7 +350,7 @@ async function handleApi(req, res, url) {
     if (r && !ALLOWED_EXT.has(path.extname(r).toLowerCase())) {
       throw httpError(400, 'Bitte eine .md- oder .mmd-Datei wählen');
     }
-    return send(res, 200, { path: r });
+    return send(res, 200, { path: r ? await selectFile(r) : null });
   }
 
   if (route === 'dialog/save' && req.method === 'POST') {
@@ -275,31 +358,41 @@ async function handleApi(req, res, url) {
     const loc = dir ? ` default location (POSIX file ${asStr(dir)})` : '';
     let r = await osascript(`${ACTIVATE}\nPOSIX path of (choose file name with prompt "Speichern unter" default name ${asStr(name || 'Diagramm.md')}${loc})`);
     if (r && !ALLOWED_EXT.has(path.extname(r).toLowerCase())) r += '.md';
-    return send(res, 200, { path: r });
+    return send(res, 200, { path: r ? await selectFile(r) : null });
   }
 
   if (route === 'dialog/folder' && req.method === 'POST') {
     const { dir } = JSON.parse(await readBody(req) || '{}');
     const loc = dir ? ` default location (POSIX file ${asStr(dir)})` : '';
     const r = await osascript(`${ACTIVATE}\nPOSIX path of (choose folder with prompt "Ordner öffnen"${loc})`);
-    return send(res, 200, { path: r ? r.replace(/\/$/, '') : null });
+    return send(res, 200, { path: r ? await selectFolder(r) : null });
   }
 
   if (route === 'asset') {
     // Bilder, die in Markdown relativ eingebunden sind
-    const p = url.searchParams.get('path');
-    const ext = path.extname(p || '').toLowerCase();
+    const requested = absolutePath(url.searchParams.get('path'));
+    const p = await resolvePath(requested);
+    const ext = path.extname(p).toLowerCase();
     const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp' };
-    if (!p || !path.isAbsolute(p) || !types[ext]) throw httpError(403, 'Nicht erlaubt');
-    const data = await fsp.readFile(path.normalize(p)).catch(() => { throw httpError(404, 'Nicht gefunden'); });
-    res.writeHead(200, { 'Content-Type': types[ext], 'Cache-Control': 'no-cache', 'Content-Security-Policy': "script-src 'none'" });
+    const mime = types[ext];
+    const nearSelectedFile = [...selectedFiles].some((file) => inside(path.dirname(file), p));
+    if (!mime || !types[path.extname(requested).toLowerCase()] || (!inSelectedFolder(p) && !nearSelectedFile)) {
+      throw httpError(403, 'Bild wurde nicht freigegeben');
+    }
+    const handle = await openRegularFile(p).catch((err) => {
+      if (err.code === 'ENOENT') throw httpError(404, 'Nicht gefunden');
+      throw err;
+    });
+    let data;
+    try { data = await handle.readFile(); } finally { await handle.close(); }
+    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-cache', 'Content-Security-Policy': "script-src 'none'" });
     res.end(data);
     return;
   }
 
   if (route === 'reveal' && req.method === 'POST') {
     const { path: p } = JSON.parse(await readBody(req) || '{}');
-    execFile('open', ['-R', checkPath(p)]);
+    execFile('open', ['-R', await checkPath(p)]);
     return send(res, 200, { ok: true });
   }
 
@@ -320,6 +413,7 @@ async function handleStatic(req, res, url) {
   res.writeHead(200, {
     'Content-Type': MIME[path.extname(full)] || 'application/octet-stream',
     'Cache-Control': rel === '/index.html' ? 'no-store' : 'no-cache',
+    'Referrer-Policy': 'no-referrer',
   });
   res.end(data);
 }
@@ -339,12 +433,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function pageUrl() {
-  const u = new URL(`http://127.0.0.1:${port}/`);
-  if (initialFile) u.searchParams.set('file', initialFile);
-  else if (initialDir) u.searchParams.set('dir', initialDir);
-  return u.toString();
-}
+function pageUrl() { return `http://127.0.0.1:${port}/`; }
 
 function open(u) {
   if (!openBrowser) return;
@@ -365,7 +454,14 @@ function probeExisting() {
 }
 
 (async () => {
-  if (await probeExisting()) {
+  if (target) {
+    const st = await fsp.stat(target).catch((err) => {
+      if (err.code !== 'ENOENT') throw err;
+      return null;
+    });
+    if (st?.isDirectory()) initialDir = await selectFolder(target);
+    else initialFile = await selectFile(target);
+  } else if (await probeExisting()) {
     console.log(`Mermaid Editor läuft bereits auf Port ${port} – öffne neuen Tab.`);
     open(pageUrl());
     return;
@@ -381,4 +477,7 @@ function probeExisting() {
     // Falls nie ein Tab verbindet
     scheduleIdleExit();
   });
-})();
+})().catch((err) => {
+  console.error(`Mermaid Editor: ${err.message}`);
+  process.exitCode = 1;
+});

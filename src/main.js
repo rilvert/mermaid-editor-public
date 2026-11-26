@@ -593,9 +593,9 @@ flowchart LR
   try { st = await api('state'); } catch { /* */ }
   state.home = st.home || '';
   const params = new URLSearchParams(location.search);
-  const dir = params.get('dir');
+  const dir = params.get('dir') || st.dir;
   const isNew = params.has('new');
-  const file = params.get('file') || (dir || isNew ? null : store.get('lastFile', null));
+  const file = params.get('file') || (isNew ? null : st.file || (dir ? null : store.get('lastFile', null)));
   setRoot(dir || store.get('root', null) || (file ? dirname(file) : `${state.home}/Documents`));
 
   if (file && (await openFile(file, { quiet: true }))) return;

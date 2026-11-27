@@ -104,20 +104,26 @@
         <input type="checkbox" id="pdf-toc">
         <span data-i18n="pdfIncludeToc"></span>
       </label>
-      <details id="pdf-breaks">
-        <summary data-i18n="pdfPageBreaks"></summary>
-        <p data-i18n="pdfBreakHelp"></p>
-        <div id="pdf-break-list"></div>
-      </details>
+      <label class="pdf-option">
+        <input type="checkbox" id="pdf-show-breaks">
+        <span data-i18n="pdfPageBreaks"></span>
+      </label>
+      <div id="pdf-preview" hidden>
+        <div class="pdf-preview-tools">
+          <span data-i18n="pdfBreakHelp"></span>
+          <button id="pdf-reset-breaks" type="button" data-i18n="pdfResetBreaks" disabled></button>
+        </div>
+        <div id="pdf-pages" tabindex="0" data-i18n-label="pdfPageBreaks"></div>
+      </div>
       <p id="pdf-browser-help" data-i18n="pdfBrowserHelp"></p>
       <p id="pdf-progress" role="status" hidden data-i18n="pdfPreparing"></p>
       <div class="dialog-actions">
-        <button value="cancel" data-i18n="cancel"></button>
+        <button type="button" value="cancel" data-i18n="cancel"></button>
         <button id="pdf-export" value="export" class="primary" data-i18n="pdfContinue"></button>
       </div>
     </form>
   </dialog>
-  <article id="pdf-document" class="markdown-body"></article>
+  <div id="pdf-document"></div>
   <div id="toast" role="status"></div>
   <script type="module" src="dist/main.js"></script>
 </body>

@@ -5,6 +5,7 @@
 import Cocoa
 import WebKit
 import UniformTypeIdentifiers
+import PDFKit
 
 let docExtensions = ["md", "markdown", "mmd", "mermaid", "txt"]
 let listExtensions: Set<String> = ["md", "markdown", "mmd", "mermaid"]
@@ -82,6 +83,144 @@ final class WeakHandler: NSObject, WKScriptMessageHandlerWithReply {
     }
 }
 
+// MARK: - PDF capture
+
+@MainActor
+final class PdfCapture: NSObject, WKNavigationDelegate {
+    private let scale: CGFloat = 0.75
+    private let view: WKWebView
+    private let stylesheet: String
+    private let document = PDFDocument()
+    private var finish: ((Data?) -> Void)?
+    private var timeout: DispatchWorkItem?
+    private var links: [(PDFPage, NSRect, String)] = []
+    private var destinations: [String: PDFDestination] = [:]
+
+    init(scheme: SchemeHandler, stylesheet: String) {
+        let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(scheme, forURLScheme: "mme")
+        let frame = NSRect(x: 0, y: 0, width: 210 * 72.0 / 25.4, height: 297 * 72.0 / 25.4)
+        view = WKWebView(frame: frame, configuration: configuration)
+        self.stylesheet = stylesheet
+        super.init()
+        view.pageZoom = scale
+        view.navigationDelegate = self
+    }
+
+    func start(markup: String, finish: @escaping (Data?) -> Void) {
+        self.finish = finish
+        resetTimeout()
+        view.loadHTMLString("""
+            <!doctype html><html><head><meta charset="utf-8">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src mme: https: http: data:">
+            <style>\(stylesheet)</style>
+            </head><body class="pdf-capture"><div id="pdf-document">\(markup)</div></body></html>
+            """, baseURL: URL(string: "mme://app/"))
+    }
+
+    private func resetTimeout() {
+        timeout?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.complete(nil) }
+        timeout = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: task)
+    }
+
+    private func complete(_ data: Data?) {
+        guard let callback = finish else { return }
+        finish = nil
+        timeout?.cancel()
+        view.stopLoading()
+        callback(data)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        capturePage(at: 0)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        complete(nil)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        complete(nil)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        complete(nil)
+    }
+
+    private func capturePage(at index: Int) {
+        guard finish != nil else { return }
+        resetTimeout()
+        // Use the same A4 markup as the preview. Capture one sheet at a time to keep
+        // the PDF within WKWebView's bounds and avoid synchronous AppKit printing.
+        view.callAsyncJavaScript("""
+            const pages = document.querySelector('#pdf-document').children;
+            if (!pages[index]) return null;
+            if (index === 0) {
+              for (const page of pages) page.hidden = true;
+            } else {
+              pages[index - 1].hidden = true;
+            }
+            pages[index].hidden = false;
+            const locate = (selector, key) => Array.from(pages[index].querySelectorAll(selector), el => {
+              const r = el.getBoundingClientRect();
+              return { key: key(el), x: r.x, y: r.y, width: r.width, height: r.height };
+            });
+            return {
+              count: pages.length,
+              links: locate('a[href^="#pdf-heading-"]', el => el.getAttribute('href').slice(1)),
+              headings: locate('[id^="pdf-heading-"]', el => el.id)
+            };
+            """, arguments: ["index": index], in: nil, in: .defaultClient) { [weak self] result in
+            guard let self, self.finish != nil else { return }
+            guard case .success(let value) = result, let positions = value as? [String: Any],
+                  let count = positions["count"] as? Int else { return self.complete(nil) }
+            let configuration = WKPDFConfiguration()
+            configuration.rect = self.view.bounds
+            self.view.createPDF(configuration: configuration) { [weak self] result in
+                guard let self, self.finish != nil else { return }
+                guard case .success(let data) = result, let captured = PDFDocument(data: data),
+                      let page = captured.page(at: 0) else { return self.complete(nil) }
+                self.document.insert(page, at: self.document.pageCount)
+                self.collectLinks(positions, on: page)
+                if index + 1 < count {
+                    self.capturePage(at: index + 1)
+                } else {
+                    for (page, bounds, key) in self.links {
+                        guard let destination = self.destinations[key] else { continue }
+                        let annotation = PDFAnnotation(bounds: bounds, forType: .link, withProperties: nil)
+                        annotation.action = PDFActionGoTo(destination: destination)
+                        let border = PDFBorder()
+                        border.lineWidth = 0
+                        annotation.border = border
+                        page.addAnnotation(annotation)
+                    }
+                    self.complete(self.document.dataRepresentation())
+                }
+            }
+        }
+    }
+
+    private func collectLinks(_ positions: [String: Any], on page: PDFPage) {
+        let height = page.bounds(for: .mediaBox).height
+        func location(_ entry: [String: Any]) -> (String, NSRect)? {
+            guard let key = entry["key"] as? String, let x = entry["x"] as? Double,
+                  let y = entry["y"] as? Double, let w = entry["width"] as? Double,
+                  let h = entry["height"] as? Double else { return nil }
+            return (key, NSRect(x: x * scale, y: height - (y + h) * scale, width: w * scale, height: h * scale))
+        }
+        for entry in positions["headings"] as? [[String: Any]] ?? [] {
+            guard let (key, rect) = location(entry) else { continue }
+            destinations[key] = PDFDestination(page: page, at: NSPoint(x: rect.minX, y: rect.maxY))
+        }
+        for entry in positions["links"] as? [[String: Any]] ?? [] {
+            guard let (key, rect) = location(entry) else { continue }
+            links.append((page, rect, key))
+        }
+    }
+}
+
 // MARK: - Fenster
 
 final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
@@ -94,6 +233,7 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
     private var watchPath: String?
     private var watchMtime: Double = 0
     private var timer: Timer?
+    private var pdfCapture: PdfCapture?
     private weak var app: AppDelegate?
 
     init(app: AppDelegate, file: String?, newDoc: Bool) {
@@ -333,6 +473,12 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             reply(["ok": true], nil)
 
         case ("export/pdf", "POST"):
+            guard pdfCapture == nil, let markup = body["markup"] as? String, let scheme = app?.scheme else {
+                return fail(400, "invalidRequest")
+            }
+            guard let stylesheet = try? String(contentsOf: scheme.root.appendingPathComponent("style.css"), encoding: .utf8) else {
+                return fail(500, "pdfGenerationFailed")
+            }
             let panel = NSSavePanel()
             panel.message = text("Als PDF exportieren", "Export as PDF")
             panel.prompt = text("Speichern", "Save")
@@ -342,32 +488,17 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             if let p = filePath { panel.directoryURL = URL(fileURLWithPath: p).deletingLastPathComponent() }
             panel.beginSheetModal(for: window) { response in
                 guard response == .OK, let url = panel.url else { return reply(["saved": false], nil) }
-                let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
-                defer { try? FileManager.default.removeItem(at: temporary) }
-                let margin: CGFloat = 15.0 * 72.0 / 25.4
-                let printInfo = NSPrintInfo(dictionary: [
-                    .jobDisposition: NSPrintInfo.JobDisposition.save,
-                    .jobSavingURL: temporary,
-                    .headerAndFooter: false
-                ])
-                printInfo.paperSize = NSSize(width: 210 * 72.0 / 25.4, height: 297 * 72.0 / 25.4)
-                printInfo.leftMargin = margin
-                printInfo.rightMargin = margin
-                printInfo.topMargin = margin
-                printInfo.bottomMargin = margin
-                printInfo.isHorizontallyCentered = false
-                printInfo.isVerticallyCentered = false
-                let operation = self.webView.printOperation(with: printInfo)
-                operation.showsPrintPanel = false
-                operation.showsProgressPanel = false
-                guard operation.run(), let data = try? Data(contentsOf: temporary), !data.isEmpty else {
-                    return fail(500, "pdfGenerationFailed")
-                }
-                do {
-                    try data.write(to: url, options: .atomic)
-                    reply(["saved": true, "path": url.path], nil)
-                } catch {
-                    fail(500, "writeFailed")
+                let capture = PdfCapture(scheme: scheme, stylesheet: stylesheet)
+                self.pdfCapture = capture
+                capture.start(markup: markup) { data in
+                    self.pdfCapture = nil
+                    guard let data else { return fail(500, "pdfGenerationFailed") }
+                    do {
+                        try data.write(to: url, options: .atomic)
+                        reply(["saved": true, "path": url.path], nil)
+                    } catch {
+                        fail(500, "writeFailed")
+                    }
                 }
             }
 

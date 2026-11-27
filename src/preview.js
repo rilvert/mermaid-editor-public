@@ -26,12 +26,14 @@ function enqueue(fn) {
 }
 
 let seq = 0;
-async function renderSvg(code) {
+async function renderSvg(code, withSync = true) {
   const id = 'mmd-' + ++seq;
   try {
     const { svg } = await mermaid.render(id, code);
     let diag = null;
-    try { diag = await mermaid.mermaidAPI.getDiagramFromText(code); } catch { /* nur für Sync */ }
+    if (withSync) {
+      try { diag = await mermaid.mermaidAPI.getDiagramFromText(code); } catch { /* nur für Sync */ }
+    }
     return { ok: true, svg, diag };
   } catch (error) {
     document.getElementById('d' + id)?.remove();
@@ -537,12 +539,13 @@ export function createPreview(scrollEl, contentEl, opts) {
   function renderLightSvg(code) {
     return enqueue(async () => {
       mermaid.initialize(mermaidConfig(false));
-      try { return await renderSvg(code); } finally { mermaid.initialize(mermaidConfig(dark)); }
+      try { return await renderSvg(code, false); } finally { mermaid.initialize(mermaidConfig(dark)); }
     });
   }
 
-  async function renderDocumentDiagrams(content, diagrams) {
+  async function renderDocumentDiagrams(content, diagrams, signal) {
     for (const slot of content.querySelectorAll('.mm-slot')) {
+      if (signal.aborted) return;
       const { code } = diagrams[Number(slot.dataset.idx)];
       const result = await renderLightSvg(code);
       if (result.ok) {
@@ -556,8 +559,6 @@ export function createPreview(scrollEl, contentEl, opts) {
         }
       } else {
         const fallback = document.createElement('pre');
-        fallback.className = slot.className;
-        fallback.classList.remove('mm-slot');
         fallback.textContent = `${t('mermaidError')}\n\n${code}`;
         slot.replaceWith(fallback);
       }

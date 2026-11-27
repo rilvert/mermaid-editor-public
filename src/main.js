@@ -167,8 +167,8 @@ const openPdfExport = createPdfExport({
   preview,
   getText: () => editor.getText(),
   getName: () => (state.path ? basename(state.path).replace(/\.[^.]+$/, '') : '') || t('untitled'),
-  savePdf: NATIVE ? async (name) => {
-    const result = await api('export/pdf', { method: 'POST', body: { name: name + '.pdf' } });
+  savePdf: NATIVE ? async (name, markup) => {
+    const result = await api('export/pdf', { method: 'POST', body: { name: name + '.pdf', markup } });
     if (result.saved) toast('exported', { name: basename(result.path) });
   } : null,
   toast,

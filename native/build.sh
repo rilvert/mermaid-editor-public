@@ -10,7 +10,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 -target arm64-apple-macos12.0 \
   -o "$APP/Contents/MacOS/MermaidEditor" native/main.swift \
-  -framework Cocoa -framework WebKit -framework UniformTypeIdentifiers
+  -framework Cocoa -framework WebKit -framework UniformTypeIdentifiers -framework PDFKit
 cp native/Info.plist "$APP/Contents/Info.plist"
 cp -R public "$APP/Contents/Resources/public"
 cp native/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"

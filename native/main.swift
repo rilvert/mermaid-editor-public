@@ -5,6 +5,7 @@
 import Cocoa
 import WebKit
 import UniformTypeIdentifiers
+import PDFKit
 
 let docExtensions = ["md", "markdown", "mmd", "mermaid", "txt"]
 let listExtensions: Set<String> = ["md", "markdown", "mmd", "mermaid"]
@@ -82,6 +83,144 @@ final class WeakHandler: NSObject, WKScriptMessageHandlerWithReply {
     }
 }
 
+// MARK: - PDF capture
+
+@MainActor
+final class PdfCapture: NSObject, WKNavigationDelegate {
+    private let scale: CGFloat = 0.75
+    private let view: WKWebView
+    private let stylesheet: String
+    private let document = PDFDocument()
+    private var finish: ((Data?) -> Void)?
+    private var timeout: DispatchWorkItem?
+    private var links: [(PDFPage, NSRect, String)] = []
+    private var destinations: [String: PDFDestination] = [:]
+
+    init(scheme: SchemeHandler, stylesheet: String) {
+        let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(scheme, forURLScheme: "mme")
+        let frame = NSRect(x: 0, y: 0, width: 210 * 72.0 / 25.4, height: 297 * 72.0 / 25.4)
+        view = WKWebView(frame: frame, configuration: configuration)
+        self.stylesheet = stylesheet
+        super.init()
+        view.pageZoom = scale
+        view.navigationDelegate = self
+    }
+
+    func start(markup: String, finish: @escaping (Data?) -> Void) {
+        self.finish = finish
+        resetTimeout()
+        view.loadHTMLString("""
+            <!doctype html><html><head><meta charset="utf-8">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src mme: https: http: data:">
+            <style>\(stylesheet)</style>
+            </head><body class="pdf-capture"><div id="pdf-document">\(markup)</div></body></html>
+            """, baseURL: URL(string: "mme://app/"))
+    }
+
+    private func resetTimeout() {
+        timeout?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.complete(nil) }
+        timeout = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: task)
+    }
+
+    private func complete(_ data: Data?) {
+        guard let callback = finish else { return }
+        finish = nil
+        timeout?.cancel()
+        view.stopLoading()
+        callback(data)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        capturePage(at: 0)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        complete(nil)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        complete(nil)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        complete(nil)
+    }
+
+    private func capturePage(at index: Int) {
+        guard finish != nil else { return }
+        resetTimeout()
+        // Use the same A4 markup as the preview. Capture one sheet at a time to keep
+        // the PDF within WKWebView's bounds and avoid synchronous AppKit printing.
+        view.callAsyncJavaScript("""
+            const pages = document.querySelector('#pdf-document').children;
+            if (!pages[index]) return null;
+            if (index === 0) {
+              for (const page of pages) page.hidden = true;
+            } else {
+              pages[index - 1].hidden = true;
+            }
+            pages[index].hidden = false;
+            const locate = (selector, key) => Array.from(pages[index].querySelectorAll(selector), el => {
+              const r = el.getBoundingClientRect();
+              return { key: key(el), x: r.x, y: r.y, width: r.width, height: r.height };
+            });
+            return {
+              count: pages.length,
+              links: locate('a[href^="#pdf-heading-"]', el => el.getAttribute('href').slice(1)),
+              headings: locate('[id^="pdf-heading-"]', el => el.id)
+            };
+            """, arguments: ["index": index], in: nil, in: .defaultClient) { [weak self] result in
+            guard let self, self.finish != nil else { return }
+            guard case .success(let value) = result, let positions = value as? [String: Any],
+                  let count = positions["count"] as? Int else { return self.complete(nil) }
+            let configuration = WKPDFConfiguration()
+            configuration.rect = self.view.bounds
+            self.view.createPDF(configuration: configuration) { [weak self] result in
+                guard let self, self.finish != nil else { return }
+                guard case .success(let data) = result, let captured = PDFDocument(data: data),
+                      let page = captured.page(at: 0) else { return self.complete(nil) }
+                self.document.insert(page, at: self.document.pageCount)
+                self.collectLinks(positions, on: page)
+                if index + 1 < count {
+                    self.capturePage(at: index + 1)
+                } else {
+                    for (page, bounds, key) in self.links {
+                        guard let destination = self.destinations[key] else { continue }
+                        let annotation = PDFAnnotation(bounds: bounds, forType: .link, withProperties: nil)
+                        annotation.action = PDFActionGoTo(destination: destination)
+                        let border = PDFBorder()
+                        border.lineWidth = 0
+                        annotation.border = border
+                        page.addAnnotation(annotation)
+                    }
+                    self.complete(self.document.dataRepresentation())
+                }
+            }
+        }
+    }
+
+    private func collectLinks(_ positions: [String: Any], on page: PDFPage) {
+        let height = page.bounds(for: .mediaBox).height
+        func location(_ entry: [String: Any]) -> (String, NSRect)? {
+            guard let key = entry["key"] as? String, let x = entry["x"] as? Double,
+                  let y = entry["y"] as? Double, let w = entry["width"] as? Double,
+                  let h = entry["height"] as? Double else { return nil }
+            return (key, NSRect(x: x * scale, y: height - (y + h) * scale, width: w * scale, height: h * scale))
+        }
+        for entry in positions["headings"] as? [[String: Any]] ?? [] {
+            guard let (key, rect) = location(entry) else { continue }
+            destinations[key] = PDFDestination(page: page, at: NSPoint(x: rect.minX, y: rect.maxY))
+        }
+        for entry in positions["links"] as? [[String: Any]] ?? [] {
+            guard let (key, rect) = location(entry) else { continue }
+            links.append((page, rect, key))
+        }
+    }
+}
+
 // MARK: - Fenster
 
 final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
@@ -94,6 +233,7 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
     private var watchPath: String?
     private var watchMtime: Double = 0
     private var timer: Timer?
+    private var pdfCapture: PdfCapture?
     private weak var app: AppDelegate?
 
     init(app: AppDelegate, file: String?, newDoc: Bool) {
@@ -102,6 +242,9 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(app.scheme, forURLScheme: "mme")
         config.websiteDataStore = .default()
+        config.userContentController.addUserScript(WKUserScript(
+            source: "window.__mmeInitialLocale = \(jsonArg(app.locale))", injectionTime: .atDocumentStart, forMainFrameOnly: true
+        ))
         webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1400, height: 900), configuration: config)
         if #available(macOS 13.3, *) { webView.isInspectable = debug }
 
@@ -150,6 +293,13 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
     }
 
     // ---------------------------------------------------------------- JS
+
+    private func text(_ de: String, _ en: String) -> String { app?.text(de, en) ?? en }
+
+    func updateLocale(_ locale: String) {
+        if filePath == nil { window.title = text("Unbenannt", "Untitled") }
+        webView.evaluateJavaScript("window.__mmeInitialLocale = \(jsonArg(locale)); window.__mmeCommand?.('locale', window.__mmeInitialLocale)", completionHandler: nil)
+    }
     func command(_ name: String) {
         webView.evaluateJavaScript("window.__mmeCommand && window.__mmeCommand(\(jsonArg(name)))", completionHandler: nil)
     }
@@ -168,11 +318,11 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             if r?["ok"] as? Bool == true { done(true); return }
             if r?["untitled"] as? Bool != true { done(false); return }
             let alert = NSAlert()
-            alert.messageText = "Möchtest du die Änderungen sichern?"
-            alert.informativeText = "Das Dokument wurde noch nie gesichert."
-            alert.addButton(withTitle: "Sichern …")
-            alert.addButton(withTitle: "Nicht sichern")
-            alert.addButton(withTitle: "Abbrechen")
+            alert.messageText = self.text("Möchtest du die Änderungen sichern?", "Do you want to save your changes?")
+            alert.informativeText = self.text("Das Dokument wurde noch nie gesichert.", "This document has never been saved.")
+            alert.addButton(withTitle: self.text("Sichern …", "Save…"))
+            alert.addButton(withTitle: self.text("Nicht sichern", "Don’t Save"))
+            alert.addButton(withTitle: self.text("Abbrechen", "Cancel"))
             alert.beginSheetModal(for: self.window) { resp in
                 switch resp {
                 case .alertFirstButtonReturn:
@@ -205,36 +355,36 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
     // ---------------------------------------------------------------- Brücke
     func handle(_ message: WKScriptMessage, _ reply: @escaping (Any?, String?) -> Void) {
         guard let msg = message.body as? [String: Any], let route = msg["route"] as? String else {
-            reply(["error": "Ungültige Anfrage", "status": 400], nil); return
+            reply(["error": "invalidRequest", "code": "invalidRequest", "status": 400], nil); return
         }
         let method = (msg["method"] as? String) ?? "GET"
         let body = (msg["body"] as? [String: Any]) ?? [:]
         let query = (msg["query"] as? [String: Any]) ?? [:]
-        let fail = { (status: Int, text: String) in reply(["error": text, "status": status], nil) }
+        let fail = { (status: Int, code: String) in reply(["error": code, "code": code, "status": status], nil) }
 
         switch (route, method) {
         case ("state", _):
             reply(["home": NSHomeDirectory(), "native": true], nil)
 
         case ("files", _):
-            guard let dir = query["dir"] as? String, dir.hasPrefix("/") else { return fail(400, "Ordner fehlt") }
+            guard let dir = query["dir"] as? String, dir.hasPrefix("/") else { return fail(400, "missingFolder") }
             DispatchQueue.global(qos: .userInitiated).async {
                 let files = listFiles(dir)
                 DispatchQueue.main.async { reply(["dir": dir, "files": files], nil) }
             }
 
         case ("file", "GET"):
-            guard let p = query["path"] as? String, p.hasPrefix("/"), isAllowedDoc(p) else { return fail(403, "Dateityp nicht erlaubt") }
+            guard let p = query["path"] as? String, p.hasPrefix("/"), isAllowedDoc(p) else { return fail(403, "unsupportedFile") }
             if !FileManager.default.fileExists(atPath: p) {
                 return reply(["path": p, "content": "", "mtime": 0, "isNew": true], nil)
             }
-            guard let data = FileManager.default.contents(atPath: p) else { return fail(500, "Datei nicht lesbar") }
+            guard let data = FileManager.default.contents(atPath: p) else { return fail(500, "unreadableFile") }
             let content = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
             NSDocumentController.shared.noteNewRecentDocumentURL(URL(fileURLWithPath: p))
             reply(["path": p, "content": content, "mtime": mtimeOf(p) ?? 0], nil)
 
         case ("file", "PUT"):
-            guard let p = body["path"] as? String, p.hasPrefix("/"), isAllowedDoc(p) else { return fail(403, "Dateityp nicht erlaubt") }
+            guard let p = body["path"] as? String, p.hasPrefix("/"), isAllowedDoc(p) else { return fail(403, "unsupportedFile") }
             let content = body["content"] as? String ?? ""
             let base = body["baseMtime"] as? Double ?? 0
             let force = body["force"] as? Bool ?? false
@@ -250,7 +400,7 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
                 NSDocumentController.shared.noteNewRecentDocumentURL(url)
                 reply(["path": p, "mtime": m], nil)
             } catch {
-                fail(500, error.localizedDescription)
+                fail(500, "writeFailed")
             }
 
         case ("stat", _):
@@ -262,12 +412,16 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             watchMtime = watchPath.flatMap(mtimeOf) ?? 0
             reply(["ok": true], nil)
 
+        case ("locale", "POST"):
+            if let locale = body["locale"] as? String { app?.setLocale(locale) }
+            reply(["ok": true], nil)
+
         case ("status", _):
             let path = body["path"] as? String
             filePath = path
             dirty = body["dirty"] as? Bool ?? false
             window.isDocumentEdited = dirty
-            window.title = path.map { ($0 as NSString).lastPathComponent } ?? "Unbenannt"
+            window.title = path.map { ($0 as NSString).lastPathComponent } ?? text("Unbenannt", "Untitled")
             window.representedURL = path.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
             if let a = body["appearance"] as? String {
                 window.appearance = NSAppearance(named: a == "dark" ? .darkAqua : .aqua)
@@ -278,6 +432,8 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
 
         case ("dialog/open", _):
             let panel = NSOpenPanel()
+            panel.message = text("Datei öffnen", "Open file")
+            panel.prompt = text("Öffnen", "Open")
             panel.allowedContentTypes = docExtensions.compactMap { UTType(filenameExtension: $0) }
             panel.allowsMultipleSelection = false
             if let d = body["dir"] as? String { panel.directoryURL = URL(fileURLWithPath: d) }
@@ -287,10 +443,13 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
 
         case ("dialog/save", _):
             let panel = NSSavePanel()
+            panel.message = text("Speichern unter", "Save as")
+            panel.prompt = text("Speichern", "Save")
+            panel.nameFieldLabel = text("Dateiname", "File name")
             panel.allowedContentTypes = ["md", "mmd"].compactMap { UTType(filenameExtension: $0) }
             panel.allowsOtherFileTypes = true
             panel.isExtensionHidden = false
-            panel.nameFieldStringValue = body["name"] as? String ?? "Diagramm.md"
+            panel.nameFieldStringValue = body["name"] as? String ?? text("Diagramm.md", "Diagram.md")
             if let d = body["dir"] as? String { panel.directoryURL = URL(fileURLWithPath: d) }
             panel.beginSheetModal(for: window) { resp in
                 guard resp == .OK, var p = panel.url?.path else { return reply(["path": NSNull()], nil) }
@@ -300,6 +459,8 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
 
         case ("dialog/folder", _):
             let panel = NSOpenPanel()
+            panel.message = text("Ordner öffnen", "Open folder")
+            panel.prompt = text("Öffnen", "Open")
             panel.canChooseDirectories = true
             panel.canChooseFiles = false
             if let d = body["dir"] as? String { panel.directoryURL = URL(fileURLWithPath: d) }
@@ -311,20 +472,53 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             if let p = body["path"] as? String { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
             reply(["ok": true], nil)
 
-        case ("export", _):
-            guard let b64 = body["data"] as? String, let data = Data(base64Encoded: b64) else { return fail(400, "Keine Daten") }
+        case ("export/pdf", "POST"):
+            guard pdfCapture == nil, let markup = body["markup"] as? String, let scheme = app?.scheme else {
+                return fail(400, "invalidRequest")
+            }
+            guard let stylesheet = try? String(contentsOf: scheme.root.appendingPathComponent("style.css"), encoding: .utf8) else {
+                return fail(500, "pdfGenerationFailed")
+            }
             let panel = NSSavePanel()
-            panel.nameFieldStringValue = body["name"] as? String ?? "diagramm"
+            panel.message = text("Als PDF exportieren", "Export as PDF")
+            panel.prompt = text("Speichern", "Save")
+            panel.allowedContentTypes = [.pdf]
+            panel.nameFieldStringValue = body["name"] as? String ?? text("Unbenannt.pdf", "Untitled.pdf")
+            panel.isExtensionHidden = false
+            if let p = filePath { panel.directoryURL = URL(fileURLWithPath: p).deletingLastPathComponent() }
+            panel.beginSheetModal(for: window) { response in
+                guard response == .OK, let url = panel.url else { return reply(["saved": false], nil) }
+                let capture = PdfCapture(scheme: scheme, stylesheet: stylesheet)
+                self.pdfCapture = capture
+                capture.start(markup: markup) { data in
+                    self.pdfCapture = nil
+                    guard let data else { return fail(500, "pdfGenerationFailed") }
+                    do {
+                        try data.write(to: url, options: .atomic)
+                        reply(["saved": true, "path": url.path], nil)
+                    } catch {
+                        fail(500, "writeFailed")
+                    }
+                }
+            }
+
+        case ("export", _):
+            guard let b64 = body["data"] as? String, let data = Data(base64Encoded: b64) else { return fail(400, "missingData") }
+            let panel = NSSavePanel()
+            panel.message = text("Speichern unter", "Save as")
+            panel.prompt = text("Speichern", "Save")
+            panel.nameFieldLabel = text("Dateiname", "File name")
+            panel.nameFieldStringValue = body["name"] as? String ?? text("diagramm", "diagram")
             panel.isExtensionHidden = false
             if let p = filePath { panel.directoryURL = URL(fileURLWithPath: p).deletingLastPathComponent() }
             panel.beginSheetModal(for: window) { resp in
                 guard resp == .OK, let url = panel.url else { return reply(["saved": false], nil) }
                 do { try data.write(to: url); reply(["saved": true, "path": url.path], nil) }
-                catch { reply(["error": error.localizedDescription, "status": 500], nil) }
+                catch { fail(500, "writeFailed") }
             }
 
         case ("copyImage", _):
-            guard let b64 = body["data"] as? String, let data = Data(base64Encoded: b64) else { return fail(400, "Keine Daten") }
+            guard let b64 = body["data"] as? String, let data = Data(base64Encoded: b64) else { return fail(400, "missingData") }
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setData(data, forType: .png)
@@ -335,13 +529,14 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
             reply(["ok": true], nil)
 
         default:
-            fail(404, "Unbekannt: \(route)")
+            fail(404, "unknownRequest")
         }
     }
 
     // ---------------------------------------------------------------- Navigation
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         loaded = true
+        if let locale = app?.locale { updateLocale(locale) }
         if let script = ProcessInfo.processInfo.environment["MME_SELFTEST"], !selftestRan {
             selftestRan = true
             runSelftest(script)
@@ -406,7 +601,7 @@ final class EditorWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUI
         let a = NSAlert()
         a.messageText = message
         a.addButton(withTitle: "OK")
-        a.addButton(withTitle: "Abbrechen")
+        a.addButton(withTitle: text("Abbrechen", "Cancel"))
         a.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
     }
 
@@ -463,6 +658,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     var scheme: SchemeHandler!
     private var launched = false
     private var pendingOpen: [String] = []
+    private(set) var locale = UserDefaults.standard.string(forKey: "EditorLocale") == "de" ? "de" : "en"
+
+    func text(_ de: String, _ en: String) -> String { locale == "en" ? en : de }
+
+    func setLocale(_ value: String) {
+        guard value == "de" || value == "en", value != locale else { return }
+        locale = value
+        UserDefaults.standard.set(value, forKey: "EditorLocale")
+        buildMenu()
+        windows.forEach { $0.updateLocale(value) }
+    }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         let root = Bundle.main.resourceURL!.appendingPathComponent("public")
@@ -540,10 +746,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
     // ---------------------------------------------------------------- Menü
+    @objc func showAbout(_ sender: Any?) {
+        let description = text("Mermaid-Editor mit Synchronisierung zwischen Code und Diagramm",
+                               "Mermaid editor with synchronization between code and diagram")
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: NSAttributedString(string: description)])
+    }
     @objc func newDocument(_ sender: Any?) { openWindow(file: nil, newDoc: true) }
     @objc func openDocument(_ sender: Any?) {
         if let w = current { w.command("open") } else {
             let panel = NSOpenPanel()
+            panel.message = text("Datei öffnen", "Open file")
+            panel.prompt = text("Öffnen", "Open")
             panel.allowedContentTypes = docExtensions.compactMap { UTType(filenameExtension: $0) }
             if panel.runModal() == .OK, let u = panel.url { open(path: u.path) }
         }
@@ -551,6 +764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func openFolder(_ sender: Any?) { current?.command("folder") }
     @objc func saveDocument(_ sender: Any?) { current?.command("save") }
     @objc func saveDocumentAs(_ sender: Any?) { current?.command("saveas") }
+    @objc func exportPDF(_ sender: Any?) { current?.command("pdf") }
     @objc func revealInFinder(_ sender: Any?) { current?.command("reveal") }
     @objc func viewCode(_ sender: Any?) { current?.command("view:code") }
     @objc func viewSplit(_ sender: Any?) { current?.command("view:split") }
@@ -560,8 +774,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func zoomOutPreview(_ sender: Any?) { current?.command("zoomOut") }
     @objc func zoomResetPreview(_ sender: Any?) { current?.command("zoomReset") }
     @objc func findInCode(_ sender: Any?) { current?.command("find") }
+    @objc func selectLanguage(_ item: NSMenuItem) {
+        if let value = item.representedObject as? String { setLocale(value) }
+    }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(selectLanguage(_:)) || item.action == #selector(showAbout(_:)) { return true }
         if item.action == #selector(newDocument(_:)) || item.action == #selector(openDocument(_:)) { return true }
         if item.action == #selector(revealInFinder(_:)) { return current?.filePath != nil }
         return current != nil
@@ -576,7 +794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menu.addItem(item)
         }
         func sub(_ title: String) -> NSMenu {
-            let item = NSMenuItem()
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             let m = NSMenu(title: title)
             item.submenu = m
             main.addItem(item)
@@ -584,64 +802,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
 
         let appMenu = sub("Mermaid Editor")
-        add(appMenu, "Über Mermaid Editor", #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
+        add(appMenu, text("Über Mermaid Editor", "About Mermaid Editor"), #selector(showAbout(_:)), target: self)
         appMenu.addItem(.separator())
-        let services = NSMenuItem(title: "Dienste", action: nil, keyEquivalent: "")
+        let services = NSMenuItem(title: text("Dienste", "Services"), action: nil, keyEquivalent: "")
         services.submenu = NSMenu()
         NSApp.servicesMenu = services.submenu
         appMenu.addItem(services)
         appMenu.addItem(.separator())
-        add(appMenu, "Mermaid Editor ausblenden", #selector(NSApplication.hide(_:)), "h")
-        add(appMenu, "Andere ausblenden", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
-        add(appMenu, "Alle einblenden", #selector(NSApplication.unhideAllApplications(_:)))
+        add(appMenu, text("Mermaid Editor ausblenden", "Hide Mermaid Editor"), #selector(NSApplication.hide(_:)), "h")
+        add(appMenu, text("Andere ausblenden", "Hide Others"), #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
+        add(appMenu, text("Alle einblenden", "Show All"), #selector(NSApplication.unhideAllApplications(_:)))
         appMenu.addItem(.separator())
-        add(appMenu, "Mermaid Editor beenden", #selector(NSApplication.terminate(_:)), "q")
+        add(appMenu, text("Mermaid Editor beenden", "Quit Mermaid Editor"), #selector(NSApplication.terminate(_:)), "q")
 
-        let file = sub("Ablage")
-        add(file, "Neu", #selector(newDocument(_:)), "n", target: self)
-        add(file, "Öffnen …", #selector(openDocument(_:)), "o", target: self)
-        let recentItem = NSMenuItem(title: "Zuletzt benutzt", action: nil, keyEquivalent: "")
-        let recent = NSMenu(title: "Zuletzt benutzt")
-        recent.addItem(NSMenuItem(title: "Einträge löschen", action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: ""))
+        let file = sub(text("Ablage", "File"))
+        add(file, text("Neu", "New"), #selector(newDocument(_:)), "n", target: self)
+        add(file, text("Öffnen …", "Open…"), #selector(openDocument(_:)), "o", target: self)
+        let recentItem = NSMenuItem(title: text("Zuletzt benutzt", "Open Recent"), action: nil, keyEquivalent: "")
+        let recent = NSMenu(title: text("Zuletzt benutzt", "Open Recent"))
+        recent.addItem(NSMenuItem(title: text("Einträge löschen", "Clear Menu"), action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: ""))
         recentItem.submenu = recent
         file.addItem(recentItem)
-        add(file, "Ordner öffnen …", #selector(openFolder(_:)), "o", [.command, .shift], target: self)
+        add(file, text("Ordner öffnen …", "Open Folder…"), #selector(openFolder(_:)), "o", [.command, .shift], target: self)
         file.addItem(.separator())
-        add(file, "Schliessen", #selector(NSWindow.performClose(_:)), "w")
-        add(file, "Sichern", #selector(saveDocument(_:)), "s", target: self)
-        add(file, "Sichern unter …", #selector(saveDocumentAs(_:)), "s", [.command, .shift], target: self)
+        add(file, text("Schliessen", "Close"), #selector(NSWindow.performClose(_:)), "w")
+        add(file, text("Sichern", "Save"), #selector(saveDocument(_:)), "s", target: self)
+        add(file, text("Sichern unter …", "Save As…"), #selector(saveDocumentAs(_:)), "s", [.command, .shift], target: self)
+        add(file, text("Als PDF exportieren …", "Export as PDF…"), #selector(exportPDF(_:)), target: self)
         file.addItem(.separator())
-        add(file, "Im Finder zeigen", #selector(revealInFinder(_:)), "r", [.command, .shift], target: self)
+        add(file, text("Im Finder zeigen", "Show in Finder"), #selector(revealInFinder(_:)), "r", [.command, .shift], target: self)
 
-        let edit = sub("Bearbeiten")
-        add(edit, "Widerrufen", Selector(("undo:")), "z")
-        add(edit, "Wiederholen", Selector(("redo:")), "z", [.command, .shift])
+        let edit = sub(text("Bearbeiten", "Edit"))
+        add(edit, text("Widerrufen", "Undo"), Selector(("undo:")), "z")
+        add(edit, text("Wiederholen", "Redo"), Selector(("redo:")), "z", [.command, .shift])
         edit.addItem(.separator())
-        add(edit, "Ausschneiden", #selector(NSText.cut(_:)), "x")
-        add(edit, "Kopieren", #selector(NSText.copy(_:)), "c")
-        add(edit, "Einsetzen", #selector(NSText.paste(_:)), "v")
-        add(edit, "Alles auswählen", #selector(NSText.selectAll(_:)), "a")
+        add(edit, text("Ausschneiden", "Cut"), #selector(NSText.cut(_:)), "x")
+        add(edit, text("Kopieren", "Copy"), #selector(NSText.copy(_:)), "c")
+        add(edit, text("Einsetzen", "Paste"), #selector(NSText.paste(_:)), "v")
+        add(edit, text("Alles auswählen", "Select All"), #selector(NSText.selectAll(_:)), "a")
         edit.addItem(.separator())
-        add(edit, "Suchen …", #selector(findInCode(_:)), "f", target: self)
+        add(edit, text("Suchen …", "Find…"), #selector(findInCode(_:)), "f", target: self)
 
-        let view = sub("Darstellung")
-        add(view, "Nur Code", #selector(viewCode(_:)), "1", target: self)
-        add(view, "Code und Diagramm", #selector(viewSplit(_:)), "2", target: self)
-        add(view, "Nur Diagramm", #selector(viewPreview(_:)), "3", target: self)
+        let view = sub(text("Darstellung", "View"))
+        add(view, text("Nur Code", "Code Only"), #selector(viewCode(_:)), "1", target: self)
+        add(view, text("Code und Diagramm", "Code and Diagram"), #selector(viewSplit(_:)), "2", target: self)
+        add(view, text("Nur Diagramm", "Diagram Only"), #selector(viewPreview(_:)), "3", target: self)
         view.addItem(.separator())
-        add(view, "Dateien ein-/ausblenden", #selector(toggleFiles(_:)), "s", [.command, .control], target: self)
+        add(view, text("Dateien ein-/ausblenden", "Toggle Files"), #selector(toggleFiles(_:)), "s", [.command, .control], target: self)
         view.addItem(.separator())
-        add(view, "Diagramme vergrössern", #selector(zoomInPreview(_:)), "+", target: self)
-        add(view, "Diagramme verkleinern", #selector(zoomOutPreview(_:)), "-", target: self)
-        add(view, "Originalgrösse", #selector(zoomResetPreview(_:)), "0", target: self)
+        add(view, text("Diagramme vergrössern", "Zoom In"), #selector(zoomInPreview(_:)), "+", target: self)
+        add(view, text("Diagramme verkleinern", "Zoom Out"), #selector(zoomOutPreview(_:)), "-", target: self)
+        add(view, text("Originalgrösse", "Actual Size"), #selector(zoomResetPreview(_:)), "0", target: self)
         view.addItem(.separator())
-        add(view, "Vollbild", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
+        add(view, text("Vollbild", "Full Screen"), #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
+        view.addItem(.separator())
+        let language = NSMenuItem(title: text("Sprache", "Language"), action: nil, keyEquivalent: "")
+        let languages = NSMenu(title: language.title)
+        for (value, title) in [("de", text("Deutsch", "German")), ("en", text("Englisch", "English"))] {
+            let item = NSMenuItem(title: title, action: #selector(selectLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            item.state = value == locale ? .on : .off
+            languages.addItem(item)
+        }
+        language.submenu = languages
+        view.addItem(language)
 
-        let win = sub("Fenster")
-        add(win, "Im Dock ablegen", #selector(NSWindow.performMiniaturize(_:)), "m")
-        add(win, "Zoomen", #selector(NSWindow.performZoom(_:)))
+        let win = sub(text("Fenster", "Window"))
+        add(win, text("Im Dock ablegen", "Minimize"), #selector(NSWindow.performMiniaturize(_:)), "m")
+        add(win, text("Zoomen", "Zoom"), #selector(NSWindow.performZoom(_:)))
         win.addItem(.separator())
-        add(win, "Alle nach vorne bringen", #selector(NSApplication.arrangeInFront(_:)))
+        add(win, text("Alle nach vorne bringen", "Bring All to Front"), #selector(NSApplication.arrangeInFront(_:)))
         NSApp.windowsMenu = win
 
         NSApp.mainMenu = main

@@ -1,6 +1,6 @@
 {
   "name": "mermaid-editor",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Leichtgewichtiger Mermaid-/Markdown-Editor mit Sync zwischen Code und Diagramm",
   "type": "commonjs",

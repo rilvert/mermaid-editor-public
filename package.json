@@ -1,12 +1,13 @@
 {
   "name": "mermaid-editor",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "description": "Leichtgewichtiger Mermaid-/Markdown-Editor mit Sync zwischen Code und Diagramm",
   "type": "commonjs",
   "scripts": {
     "build": "node build.mjs",
     "app": "node build.mjs && ./native/build.sh",
+    "android": "./android/build.sh",
     "dev": "node server.js"
   },
   "devDependencies": {

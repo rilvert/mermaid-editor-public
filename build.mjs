@@ -11,7 +11,7 @@ const ctx = await esbuild.context({
   minify: !watch,
   sourcemap: watch ? 'inline' : false,
   target: ['safari16', 'chrome110'],
-  outdir: 'public/dist',
+  outdir: process.env.MME_WEB_OUTDIR || 'public/dist',
   chunkNames: 'chunks/[name]-[hash]',
   legalComments: 'none',
   logLevel: 'warning',

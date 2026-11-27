@@ -457,3 +457,37 @@ html.native #offline { display: none !important; }
   #sidebar { width: auto; flex: 0 1 auto; max-height: 30%; border-right: none; border-bottom: 1px solid var(--border); }
   .markdown-body { padding-top: 12px; }
 }
+
+/* ---------- Android ---------- */
+html:not(.android) #menu [data-act="find"],
+html:not(.android) #menu [data-act="newMermaid"],
+html.android #menu [data-act="reveal"],
+html.android #menu kbd,
+html.android #file-dir { display: none; }
+html.android button,
+html.android .toolbar .seg button,
+html.android #menu button,
+html.android #file-list .file { min-height: 40px; }
+html.android button.icon { width: 40px; }
+html.android #menu { top: calc(100% + 6px); }
+html.android .mm-tools button { min-height: 36px; }
+html.android #divider { flex-basis: 12px; touch-action: none; padding-inline: 5px; }
+
+@media (max-width: 600px) {
+  html.android .toolbar { gap: 4px 6px; padding: 4px 8px; }
+  html.android .toolbar .center { order: 1; flex: 1 0 100%; }
+  html.android .toolbar .zoom,
+  html.android .toolbar #btn-open,
+  html.android .toolbar #btn-save { order: 2; }
+  html.android .toolbar .zoom { margin-right: auto; }
+  html.android #workspace,
+  html.android #panes { flex-direction: column; }
+  html.android #sidebar { width: auto; flex: 0 1 auto; max-height: 30%; border-right: none; border-bottom: 1px solid var(--border); }
+  html.android #editor-pane, html.android #preview-pane { min-height: 0; }
+  html.android #divider { cursor: row-resize; padding: 5px 0; }
+}
+
+@media (max-width: 340px) {
+  html.android .toolbar .zoom button.icon { width: 32px; }
+  html.android #zoom-val { min-width: 46px; }
+}

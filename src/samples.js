@@ -107,6 +107,6 @@ Open: **⌘O** · Save: **⌘S** · View: **Ctrl+1 / 2 / 3**
 `;
 
 export const samples = {
-  de: { newDoc: SAMPLE_NEW, welcome: SAMPLE_WELCOME },
-  en: { newDoc: NEW_EN, welcome: WELCOME_EN },
+  de: { newDoc: SAMPLE_NEW, welcome: SAMPLE_WELCOME, newMermaid: 'flowchart LR\n  A[Start] --> B[Ende]\n' },
+  en: { newDoc: NEW_EN, welcome: WELCOME_EN, newMermaid: 'flowchart LR\n  A[Start] --> B[End]\n' },
 };

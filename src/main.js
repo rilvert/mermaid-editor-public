@@ -17,9 +17,30 @@ const basename = (p) => p.replace(/^.*\//, '');
 const kindOf = (p) => (/\.(mmd|mermaid)$/i.test(p || '') ? 'mermaid' : 'markdown');
 
 // ---------------------------------------------------------------- API
-// In der Mac-App läuft alles über die native Brücke, im Browser über den lokalen Server.
-const NATIVE = window.webkit?.messageHandlers?.mme || null;
-if (NATIVE) document.documentElement.classList.add('native');
+const ANDROID = window.MmeAndroid;
+const MAC = window.webkit?.messageHandlers?.mme;
+const NATIVE = ANDROID ? androidBridge(ANDROID) : MAC;
+if (MAC) document.documentElement.classList.add('native');
+if (ANDROID) document.documentElement.classList.add('android');
+
+function androidBridge(bridge) {
+  let nextId = 0;
+  const pending = new Map();
+  window.__mmeAndroidReply = (id, json) => {
+    const resolve = pending.get(id);
+    pending.delete(id);
+    resolve?.(JSON.parse(json));
+  };
+  return {
+    postMessage(message) {
+      return new Promise((resolve) => {
+        const id = ++nextId;
+        bridge.send(id, JSON.stringify(message));
+        pending.set(id, resolve);
+      });
+    },
+  };
+}
 
 async function api(route, { method = 'GET', body, query } = {}) {
   if (NATIVE) {
@@ -57,7 +78,7 @@ const state = {
   view: store.get('view', 'split'),
   sidebar: store.get('sidebar', false),
   theme: store.get('theme', 'auto'),
-  locale: normalizeLocale(window.__mmeInitialLocale ?? store.get('locale')),
+  locale: normalizeLocale(ANDROID?.locale() ?? window.__mmeInitialLocale ?? store.get('locale')),
   sample: null,
   files: [],
 };
@@ -115,6 +136,13 @@ function updateDirty() {
   updateTitle();
 }
 
+function rememberAndroidEdits() {
+  if (!ANDROID || !state.path) return;
+  store.set('recovery', state.dirty ? {
+    path: state.path, mtime: state.mtime, content: editor.getText(),
+  } : null);
+}
+
 // ---------------------------------------------------------------- Editor + Vorschau
 let previewTimer;
 let syncTimer;
@@ -125,9 +153,13 @@ const editor = createEditor($('#editor'), {
   onChange() {
     state.sample = null;
     updateDirty();
+    rememberAndroidEdits();
     clearTimeout(previewTimer);
     previewTimer = setTimeout(() => preview.update(editor.getText()), 220);
-    if (!state.path) store.set('draft', editor.getText());
+    if (!state.path) {
+      store.set('draft', editor.getText());
+      if (ANDROID) store.set('draftKind', state.kind);
+    }
     clearTimeout(autoTimer);
     if (state.autosave && state.path && !state.conflict) autoTimer = setTimeout(() => { if (state.dirty) save(); }, 900);
   },
@@ -179,6 +211,7 @@ const openPdfExport = createPdfExport({
     if (result.saved) toast('exported', { name: basename(result.path) });
   } : null,
   toast,
+  systemPrint: Boolean(ANDROID),
 });
 
 function toBase64(blob) {
@@ -238,6 +271,7 @@ function applyTheme() {
 darkMq.addEventListener('change', () => state.theme === 'auto' && applyTheme());
 
 // Trennlinie ziehen
+const stacked = matchMedia('(max-width: 600px)');
 {
   const div = $('#divider');
   const ws = $('#panes');
@@ -248,21 +282,26 @@ darkMq.addEventListener('change', () => state.theme === 'auto' && applyTheme());
     div.setPointerCapture(e.pointerId);
     document.body.classList.add('resizing');
     const pane = $('#editor-pane').getBoundingClientRect();
-    const total = $('#editor-pane').offsetWidth + $('#preview-pane').offsetWidth;
+    const vertical = ANDROID && stacked.matches;
+    const total = vertical ? $('#editor-pane').offsetHeight + $('#preview-pane').offsetHeight :
+      $('#editor-pane').offsetWidth + $('#preview-pane').offsetWidth;
     const move = (ev) => {
-      const pct = Math.max(15, Math.min(85, ((ev.clientX - pane.left) / total) * 100));
+      const offset = vertical ? ev.clientY - pane.top : ev.clientX - pane.left;
+      const pct = Math.max(15, Math.min(85, (offset / total) * 100));
       ws.style.setProperty('--split', pct + '%');
       store.set('split', Math.round(pct * 10) / 10);
     };
     const up = () => {
       div.removeEventListener('pointermove', move);
       div.removeEventListener('pointerup', up);
+      div.removeEventListener('pointercancel', up);
       document.body.classList.remove('resizing');
       editor.view.requestMeasure();
       preview.refresh();
     };
     div.addEventListener('pointermove', move);
     div.addEventListener('pointerup', up);
+    div.addEventListener('pointercancel', up);
   });
   div.addEventListener('dblclick', () => { ws.style.setProperty('--split', '50%'); store.set('split', 50); });
 }
@@ -276,6 +315,13 @@ function connectEvents() {
     window.__mmeNative = (ev) => {
       if (ev.type === 'change' && ev.path === state.path && Math.abs(ev.mtime - state.mtime) > 1) onExternalChange();
     };
+    if (ANDROID) {
+      window.__mmeAndroidPause = () => {
+        rememberAndroidEdits();
+        if (state.path && state.dirty && state.autosave && !state.conflict) save();
+      };
+      window.__mmeAndroidResume = onExternalChange;
+    }
     clientId = 'native';
     return;
   }
@@ -302,12 +348,15 @@ function watch(path) {
 
 async function onExternalChange() {
   if (!state.path || state.saving) return;
+  const { path, mtime } = state;
   let r;
-  try { r = await api('file', { query: { path: state.path } }); } catch { return; }
+  try { r = await api('file', { query: { path } }); } catch { return; }
+  if (path !== state.path || mtime !== state.mtime || state.saving || r.mtime === state.mtime) return;
   if (r.content === editor.getText()) {
     state.mtime = r.mtime;
     state.saved = r.content;
     updateDirty();
+    rememberAndroidEdits();
     return;
   }
   if (!state.dirty) {
@@ -315,6 +364,7 @@ async function onExternalChange() {
     state.mtime = r.mtime;
     editor.replaceDoc(r.content);
     updateDirty();
+    rememberAndroidEdits();
     toast('reloaded');
   } else {
     showConflict(r);
@@ -334,6 +384,7 @@ function showConflict(disk) {
     editor.replaceDoc(r.content);
     bar.hidden = true;
     updateDirty();
+    rememberAndroidEdits();
   };
   bar.querySelector('[data-act="keep"]').onclick = async () => {
     state.conflict = false;
@@ -353,8 +404,21 @@ function confirmDiscard() {
   });
 }
 
-async function openFile(path, { quiet = false } = {}) {
-  if (state.dirty && state.path && !state.conflict) await save();
+async function prepareAndroidSwitch() {
+  if (activeSave) await activeSave;
+  if (!state.dirty || state.sample) return true;
+  if (state.path && !state.conflict) {
+    await save();
+    if (!state.dirty) return true;
+  }
+  return confirmDiscard();
+}
+
+async function openFile(path, { quiet = false, recovery = null } = {}) {
+  if (ANDROID) {
+    if (path === state.path) return true;
+    if (!await prepareAndroidSwitch()) return false;
+  } else if (state.dirty && state.path && !state.conflict) await save();
   else if (state.dirty && !state.path && editor.getText().trim() && !(await confirmDiscard())) return false;
   let r;
   try {
@@ -365,15 +429,17 @@ async function openFile(path, { quiet = false } = {}) {
   }
   state.sample = null;
   state.path = r.path;
-  state.mtime = r.mtime;
+  const recovered = recovery?.path === r.path && recovery.content !== r.content;
+  state.mtime = recovered ? recovery.mtime : r.mtime;
   state.saved = r.content;
   state.kind = kindOf(r.path);
   state.conflict = false;
   $('#conflict').hidden = true;
   preview.setKind(state.kind);
-  editor.setDoc(r.content, state.kind);
+  editor.setDoc(recovered ? recovery.content : r.content, state.kind);
   editor.setWrap(state.wrap);
   store.set('lastFile', r.path);
+  if (ANDROID) store.set('draft', null);
   const u = new URL(location.href);
   u.searchParams.delete('dir');
   u.searchParams.set('file', r.path);
@@ -382,21 +448,28 @@ async function openFile(path, { quiet = false } = {}) {
   if (!state.root || !r.path.startsWith(state.root + '/')) setRoot(dirname(r.path));
   else markActiveFile();
   updateDirty();
+  if (recovered && recovery.mtime !== r.mtime) showConflict(r);
+  rememberAndroidEdits();
   renderNow();
   if (r.isNew) toast('newFile');
   return true;
 }
 
-function newDoc() {
-  if (state.dirty && state.path) save();
+async function newDoc(kind = 'markdown') {
+  if (ANDROID) {
+    if (!await prepareAndroidSwitch()) return;
+    store.set('lastFile', null);
+    store.set('draft', null);
+    store.set('recovery', null);
+  } else if (state.dirty && state.path) save();
   state.path = null;
   state.mtime = 0;
   state.saved = '';
-  state.kind = 'markdown';
-  state.sample = 'newDoc';
+  state.kind = kind;
+  state.sample = kind === 'mermaid' ? 'newMermaid' : 'newDoc';
   store.set('pdf.draft', null);
-  preview.setKind('markdown');
-  editor.setDoc(samples[state.locale].newDoc, 'markdown');
+  preview.setKind(kind);
+  editor.setDoc(samples[state.locale][state.sample], kind);
   editor.setWrap(state.wrap);
   const u = new URL(location.href);
   u.searchParams.delete('file');
@@ -408,13 +481,21 @@ function newDoc() {
 }
 
 let dialogOpen = false;
+let activeSave = null;
 
-async function save({ as = false, force = false } = {}) {
+function save(options) {
+  if (!ANDROID) return saveDocument(options);
+  if (activeSave) return activeSave;
+  activeSave = saveDocument(options).finally(() => { activeSave = null; });
+  return activeSave;
+}
+
+async function saveDocument({ as = false, force = false } = {}) {
   if (state.saving) { state.saveAgain = true; return; }
   let path = state.path;
   if (!path || as) {
     if (dialogOpen) return;
-    const name = state.path ? basename(state.path) : t('diagramFile') + '.md';
+    const name = state.path ? basename(state.path) : t('diagramFile') + (state.kind === 'mermaid' ? '.mmd' : '.md');
     dialogOpen = true;
     const r = await api('dialog/save', { method: 'POST', body: { dir: state.path ? dirname(state.path) : state.root || state.home, name } })
       .catch((e) => { toast('saveFailed', { reason: () => errorText(e) }); return {}; })
@@ -457,6 +538,11 @@ async function save({ as = false, force = false } = {}) {
   } finally {
     state.saving = false;
     updateDirty();
+    rememberAndroidEdits();
+    if (ANDROID && state.saved === content && state.dirty && state.autosave && !state.conflict) {
+      clearTimeout(autoTimer);
+      autoTimer = setTimeout(save, 900);
+    }
     if (state.saveAgain) { state.saveAgain = false; if (state.dirty) save(); }
   }
 }
@@ -466,7 +552,7 @@ async function openDialog() {
   dialogOpen = true;
   try {
     const r = await api('dialog/open', { method: 'POST', body: { dir: state.path ? dirname(state.path) : state.root } });
-    if (r.path) openFile(r.path);
+    if (r.path) await openFile(r.path);
   } catch (e) { toast('openFailed', { reason: () => errorText(e) }); } finally { dialogOpen = false; }
 }
 
@@ -573,8 +659,10 @@ menu.addEventListener('click', (e) => {
   if (b.dataset.locale) { changeLocale(b.dataset.locale, { notifyNative: true }); return; }
   showMenu(false);
   if (act === 'new') newDoc();
+  if (act === 'newMermaid') newDoc('mermaid');
   if (act === 'open') openDialog();
   if (act === 'folder') folderDialog();
+  if (act === 'find') findInCode();
   if (act === 'saveas') save({ as: true });
   if (act === 'pdf') openPdfExport();
   if (act === 'reveal') revealFile();
@@ -585,6 +673,11 @@ function revealFile() {
   if (state.path) api('reveal', { method: 'POST', body: { path: state.path } }).catch((e) => {
     toast('openFailed', { reason: () => errorText(e) });
   });
+}
+
+function findInCode() {
+  if (state.view === 'preview') setView('split');
+  editor.openSearch();
 }
 
 function syncMenu() {
@@ -658,12 +751,17 @@ window.addEventListener('beforeunload', (e) => {
   const file = params.get('file') || (isNew ? null : st.file || (dir ? null : store.get('lastFile', null)));
   setRoot(dir || store.get('root', null) || (file ? dirname(file) : `${state.home}/Documents`));
 
-  if (file && (await openFile(file, { quiet: true }))) return;
+  const recovery = ANDROID ? store.get('recovery', null) : null;
+  if (file && (await openFile(file, { quiet: true, recovery }))) return;
   if (isNew) { newDoc(); return; }
-  const draft = store.get('draft', null);
+  const draft = recovery?.content ?? store.get('draft', null);
   const text = draft || samples[state.locale].welcome;
   state.sample = draft ? null : 'welcome';
-  editor.setDoc(text, 'markdown');
+  if (ANDROID && draft) {
+    state.kind = recovery ? kindOf(recovery.path) : store.get('draftKind', 'markdown');
+    preview.setKind(state.kind);
+  }
+  editor.setDoc(text, state.kind);
   editor.setWrap(state.wrap);
   state.saved = draft ? '' : text;
   updateDirty();
@@ -689,7 +787,7 @@ window.__mmeCommand = (name, arg) => {
     zoomIn: () => preview.setZoom(preview.getZoom() * 1.2),
     zoomOut: () => preview.setZoom(preview.getZoom() / 1.2),
     zoomReset: () => preview.setZoom(1),
-    find: () => { if (state.view === 'preview') setView('split'); editor.openSearch(); },
+    find: findInCode,
     discard: () => { store.set('draft', null); state.saved = editor.getText(); updateDirty(); },
   }[name];
   return c ? c() : undefined;

@@ -173,7 +173,7 @@ function blockAnchors(content, text) {
   });
 }
 
-export function createPdfExport({ preview, getText, getName, getSettingsKey, readSettings, writeSettings, savePdf, toast }) {
+export function createPdfExport({ preview, getText, getName, getSettingsKey, readSettings, writeSettings, savePdf, toast, systemPrint }) {
   const dialog = document.querySelector('#pdf-dialog');
   const output = document.querySelector('#pdf-document');
   const toc = dialog.querySelector('#pdf-toc');
@@ -184,7 +184,7 @@ export function createPdfExport({ preview, getText, getName, getSettingsKey, rea
   const progress = dialog.querySelector('#pdf-progress');
   const submit = dialog.querySelector('#pdf-export');
   const cancel = dialog.querySelector('[value="cancel"]');
-  if (savePdf) {
+  if (savePdf && !systemPrint) {
     dialog.querySelector('#pdf-browser-help').hidden = true;
     submit.dataset.i18n = 'pdfSave';
   }

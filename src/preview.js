@@ -2,6 +2,7 @@
 import mermaid from 'mermaid';
 import MarkdownIt from 'markdown-it';
 import { buildSyncMap, errorLine } from './sync.js';
+import { errorText, t, translate } from './i18n.js';
 
 const FONT = '-apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif';
 
@@ -35,11 +36,11 @@ async function renderSvg(code) {
   } catch (error) {
     document.getElementById('d' + id)?.remove();
     document.getElementById(id)?.remove();
+    // A failed text measurement can leave a temporary SVG in the page layout.
+    document.querySelectorAll('body > svg:not([id])').forEach((svg) => svg.remove());
     return { ok: false, error };
   }
 }
-
-const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
 function union(rects) {
   let r = null;
@@ -97,7 +98,7 @@ export function createPreview(scrollEl, contentEl, opts) {
     if (info === 'mermaid' || info === 'mmd') {
       const i = env.blocks.length;
       env.blocks.push({ code: tok.content.replace(/\n$/, ''), fence: tok.map[0], codeStart: tok.map[0] + 1, end: tok.map[1] });
-      return `<div class="mm-slot" data-idx="${i}"></div>\n`;
+      return `<div class="mm-slot" data-idx="${i}" data-line="${tok.map[0]}"></div>\n`;
     }
     tok.attrSet('data-line', String(tok.map[0]));
     tok.attrSet('data-end', String(tok.map[1]));
@@ -117,16 +118,29 @@ export function createPreview(scrollEl, contentEl, opts) {
     return defaultImage(tokens, idx, options, env, slf);
   };
 
+  function renderDocument(text, documentKind) {
+    const env = { blocks: [] };
+    const content = document.createElement('div');
+    if (documentKind === 'mermaid') {
+      env.blocks.push({ code: text, fence: -1, codeStart: 0, end: text.split('\n').length });
+      content.innerHTML = '<div class="mm-slot" data-idx="0" data-line="0"></div>';
+    } else {
+      content.innerHTML = md.render(text, env);
+    }
+    return { content, diagrams: env.blocks };
+  }
+
   // ------------------------------------------------------------ Wrapper
   function makeWrapper() {
     const w = document.createElement('div');
     w.className = 'mm-block';
     w.innerHTML =
       '<div class="mm-tools">' +
-      '<button data-act="svg" title="Als SVG speichern">SVG</button>' +
-      '<button data-act="png" title="Als PNG speichern">PNG</button>' +
-      '<button data-act="copy" title="Als Bild kopieren">Kopieren</button>' +
+      '<button data-act="svg" data-i18n-title="saveSvg">SVG</button>' +
+      '<button data-act="png" data-i18n-title="savePng">PNG</button>' +
+      '<button data-act="copy" data-i18n-title="copyImage" data-i18n="copy"></button>' +
       '</div><div class="mm-scroll"><div class="mm-overlay"></div></div>';
+    translate(w);
     return w;
   }
 
@@ -180,13 +194,30 @@ export function createPreview(scrollEl, contentEl, opts) {
       }
       const rel = errorLine(code, res.error);
       w._errLine = rel;
-      const msg = String(res.error?.message || res.error).replace(/\s+$/, '');
       const err = document.createElement('div');
       err.className = 'mm-error';
-      err.innerHTML = `<div class="mm-error-head">Mermaid-Fehler${rel >= 0 ? ` <button class="mm-errline" data-rel="${rel}">→ Zeile ${rel + 1}</button>` : ''}</div><pre>${esc(msg)}</pre>`;
+      err.innerHTML = `<div class="mm-error-head"><span data-i18n="mermaidError"></span>${rel >= 0 ? ` <button class="mm-errline" data-rel="${rel}"></button>` : ''}</div><pre></pre>`;
+      w._renderError = res.error;
       w.appendChild(err);
+      translate(err);
+      updateErrorDetails(w);
     }
     return w;
+  }
+
+  function updateErrorDetails(w) {
+    if (!w.classList.contains('mm-has-error')) return;
+    const error = w._renderError;
+    const message = String(error?.message || error);
+    const hash = error?.hash;
+    const unknown = error?.name === 'UnknownDiagramError' || message.startsWith('No diagram type detected');
+    const syntax = hash || w._errLine >= 0;
+    const details = [t(unknown ? 'unknownDiagram' : syntax ? 'syntaxError' : 'renderFailed')];
+    const source = w._code.split('\n')[w._errLine];
+    if (source) details.push(source);
+    if (hash?.expected?.length) details.push(t('expectedToken', { tokens: hash.expected.join(', ') }));
+    if (hash?.token) details.push(t('foundToken', { token: hash.token }));
+    w.querySelector('.mm-error pre').textContent = details.join('\n');
   }
 
   function getOrRender(key, code, prevSvg) {
@@ -205,21 +236,11 @@ export function createPreview(scrollEl, contentEl, opts) {
   // ------------------------------------------------------------ Update
   async function update(text) {
     const v = ++version;
-    const env = { blocks: [] };
-    let html;
-    if (kind === 'mermaid') {
-      const n = text.split('\n').length;
-      env.blocks.push({ code: text, fence: -1, codeStart: 0, end: n });
-      html = '<div class="mm-slot" data-idx="0"></div>';
-    } else {
-      html = md.render(text, env);
-    }
-    const frag = document.createElement('div');
-    frag.innerHTML = html;
+    const { content: frag, diagrams } = renderDocument(text, kind);
 
     const dup = new Map();
     const jobs = [];
-    const next = env.blocks.map((b, i) => {
+    const next = diagrams.map((b, i) => {
       const n = dup.get(b.code) || 0;
       dup.set(b.code, n + 1);
       const key = `${dark ? 'd' : 'l'}|${n}|${b.code}`;
@@ -232,7 +253,13 @@ export function createPreview(scrollEl, contentEl, opts) {
           const clone = prevSvg.cloneNode(true);
           clone.querySelectorAll('.sync-el').forEach((el) => el.classList.remove('sync-el'));
           w.querySelector('.mm-scroll').prepend(clone);
-        } else w.querySelector('.mm-scroll').insertAdjacentHTML('afterbegin', '<div class="mm-loading">Rendere Diagramm …</div>');
+        } else {
+          const loading = document.createElement('div');
+          loading.className = 'mm-loading';
+          loading.dataset.i18n = 'rendering';
+          loading.textContent = t('rendering');
+          w.querySelector('.mm-scroll').prepend(loading);
+        }
         jobs.push({ i, key, b, placeholder: w, prevSvg });
       }
       const slot = frag.querySelector(`.mm-slot[data-idx="${i}"]`);
@@ -278,7 +305,7 @@ export function createPreview(scrollEl, contentEl, opts) {
       const abs = b.codeStart + b.wrapper._errLine;
       lines.push(abs);
       const btn = b.wrapper.querySelector('.mm-errline');
-      if (btn) btn.textContent = `→ Zeile ${abs + 1}`;
+      if (btn) btn.textContent = t('errorLine', { line: abs + 1 });
     }
     onErrors?.(lines);
   }
@@ -433,7 +460,11 @@ export function createPreview(scrollEl, contentEl, opts) {
   contentEl.addEventListener('click', async (e) => {
     if (e.target.closest('a')) return;
     const tool = e.target.closest('.mm-tools button');
-    if (tool) { exportBlock(tool.closest('.mm-block'), tool.dataset.act); return; }
+    if (tool) {
+      try { await exportBlock(tool.closest('.mm-block'), tool.dataset.act); }
+      catch (error) { toast('exportFailed', { reason: () => errorText(error) }); }
+      return;
+    }
     const errBtn = e.target.closest('.mm-errline');
     if (errBtn) {
       const b = blockOf(errBtn.closest('.mm-block'));
@@ -476,11 +507,66 @@ export function createPreview(scrollEl, contentEl, opts) {
   async function exportBlock(w, act) {
     const b = blockOf(w);
     if (!b) return;
-    const res = await enqueue(async () => {
+    if (act === 'copy' && !opts.copyImage) {
+      if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+        toast('copyBlocked');
+        return;
+      }
+      const file = renderExport(b, w, 'png');
+      const image = file.then((result) => {
+        if (!result) throw new Error('Missing export image');
+        return result.blob;
+      });
+      // WebKit requires the write to begin during the click, before the image is ready.
+      image.catch(() => {});
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': image })]);
+        toast('copied');
+      } catch {
+        if (await file) toast('copyBlocked');
+      }
+      return;
+    }
+
+    const file = await renderExport(b, w, act === 'svg' ? 'svg' : 'png');
+    if (!file) return;
+    if (act === 'copy') await opts.copyImage(file.blob);
+    else await (opts.saveFile || download)(file.blob, file.name);
+  }
+
+  function renderLightSvg(code) {
+    return enqueue(async () => {
       mermaid.initialize(mermaidConfig(false));
-      try { return await renderSvg(b.code); } finally { mermaid.initialize(mermaidConfig(dark)); }
+      try { return await renderSvg(code); } finally { mermaid.initialize(mermaidConfig(dark)); }
     });
-    if (!res.ok) { toast('Export nicht möglich: Diagramm hat Fehler'); return; }
+  }
+
+  async function renderDocumentDiagrams(content, diagrams) {
+    for (const slot of content.querySelectorAll('.mm-slot')) {
+      const { code } = diagrams[Number(slot.dataset.idx)];
+      const result = await renderLightSvg(code);
+      if (result.ok) {
+        slot.classList.replace('mm-slot', 'pdf-diagram');
+        slot.innerHTML = result.svg;
+        const svg = slot.querySelector('svg');
+        const { width, height } = svg.viewBox.baseVal;
+        if (width > 0 && height > 0) {
+          // Fit tall diagrams within the printable area of an A4 page.
+          svg.style.width = Math.min(width, width * 900 / height) + 'px';
+        }
+      } else {
+        const fallback = document.createElement('pre');
+        fallback.className = slot.className;
+        fallback.classList.remove('mm-slot');
+        fallback.textContent = `${t('mermaidError')}\n\n${code}`;
+        slot.replaceWith(fallback);
+      }
+    }
+  }
+
+  async function renderExport(b, w, format) {
+    const res = await renderLightSvg(b.code);
+    if (!res.ok) { toast('exportInvalid'); return; }
     const doc = new DOMParser().parseFromString(res.svg, 'image/svg+xml');
     const svg = doc.documentElement;
     const vb = (svg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
@@ -491,14 +577,13 @@ export function createPreview(scrollEl, contentEl, opts) {
     svg.style.maxWidth = '';
     const text = new XMLSerializer().serializeToString(svg);
     const base = (w._title || opts.baseName() + (blocks.length > 1 ? '-' + (blocks.indexOf(b) + 1) : ''))
-      .replace(/[\\/:*?"<>|]+/g, '_').trim() || 'diagramm';
-    const saveAs = opts.saveFile || download;
-    if (act === 'svg') { saveAs(new Blob([text], { type: 'image/svg+xml' }), base + '.svg'); return; }
+      .replace(/[\\/:*?"<>|]+/g, '_').trim() || t('diagramFile').toLowerCase();
+    if (format === 'svg') return { blob: new Blob([text], { type: 'image/svg+xml' }), name: base + '.svg' };
 
     const scale = 2;
     const img = new Image();
     img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(text);
-    try { await img.decode(); } catch { toast('PNG-Export fehlgeschlagen'); return; }
+    try { await img.decode(); } catch { toast('pngFailed'); return; }
     const canvas = document.createElement('canvas');
     canvas.width = W * scale;
     canvas.height = H * scale;
@@ -506,15 +591,9 @@ export function createPreview(scrollEl, contentEl, opts) {
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    const blob = () => new Promise((r) => canvas.toBlob(r, 'image/png'));
-    if (act === 'png') { saveAs(await blob(), base + '.png'); return; }
-    if (opts.copyImage) { opts.copyImage(blob()); return; }
-    try {
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob() })]);
-      toast('Diagramm als Bild kopiert');
-    } catch {
-      toast('Kopieren nicht erlaubt – bitte PNG speichern');
-    }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) { toast('pngFailed'); return; }
+    return { blob, name: base + '.png' };
   }
 
   // ------------------------------------------------------------ Zoom/Theme
@@ -528,8 +607,17 @@ export function createPreview(scrollEl, contentEl, opts) {
 
   return {
     update,
+    renderDocument: (text) => renderDocument(text, kind),
+    renderDocumentDiagrams,
     highlightLines,
     refresh,
+    setLocale() {
+      for (const w of new Set([...cache.values(), ...blocks.map((b) => b.wrapper)])) {
+        translate(w);
+        updateErrorDetails(w);
+      }
+      reportErrors();
+    },
     setKind(k) { kind = k; },
     setDark(d) {
       if (d === dark) return;

@@ -1,10 +1,10 @@
 // CodeMirror-Setup: Markdown mit eingebettetem Mermaid, Markierungen für den Sync.
 import { basicSetup } from 'codemirror';
 import { EditorView, Decoration, keymap } from '@codemirror/view';
-import { EditorState, StateField, StateEffect, Compartment } from '@codemirror/state';
+import { EditorState, StateField, StateEffect, Compartment, Annotation, Transaction } from '@codemirror/state';
 import { StreamLanguage, LanguageSupport, LanguageDescription, syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { indentWithTab } from '@codemirror/commands';
-import { openSearchPanel } from '@codemirror/search';
+import { gotoLine, openSearchPanel } from '@codemirror/search';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { tags as t } from '@lezer/highlight';
@@ -138,12 +138,45 @@ const baseTheme = EditorView.theme({
   '.cm-error-line': { backgroundColor: 'var(--err-soft)', boxShadow: 'inset 3px 0 0 var(--err)' },
 });
 
+const germanPhrases = {
+  'Find': 'Suchen',
+  'Replace': 'Ersetzen',
+  'next': 'Weiter',
+  'previous': 'Zurück',
+  'all': 'Alle',
+  'match case': 'Gross-/Kleinschreibung',
+  'regexp': 'Regulärer Ausdruck',
+  'by word': 'Ganze Wörter',
+  'replace': 'Ersetzen',
+  'replace all': 'Alle ersetzen',
+  'close': 'Schliessen',
+  'Go to line': 'Gehe zu Zeile',
+  'go': 'Gehe zu',
+  'replaced match on line $': 'Treffer in Zeile $ ersetzt',
+  'replaced $ matches': '$ Treffer ersetzt',
+  'current match': 'Aktueller Treffer',
+  'on line': 'in Zeile',
+  'Folded lines': 'Eingeklappte Zeilen',
+  'Unfolded lines': 'Ausgeklappte Zeilen',
+  'to': 'bis',
+  'folded code': 'Eingeklappter Code',
+  'unfold': 'Ausklappen',
+  'Fold line': 'Zeile einklappen',
+  'Unfold line': 'Zeile ausklappen',
+  'Selection deleted': 'Auswahl gelöscht',
+  'Control character': 'Steuerzeichen',
+};
+
+const sampleTranslation = Annotation.define();
+
 // ---------------------------------------------------------------- API
 
-export function createEditor(parent, { onChange, onSelection }) {
+export function createEditor(parent, { locale, onChange, onSelection }) {
   const themeC = new Compartment();
   const langC = new Compartment();
   const wrapC = new Compartment();
+  const phrasesC = new Compartment();
+  const phrases = () => EditorState.phrases.of(locale === 'de' ? germanPhrases : {});
 
   const lang = (kind) => (kind === 'mermaid' ? mermaidSupport : markdown({ codeLanguages: [mermaidDesc] }));
   const theme = (dark) => (dark ? [oneDark, syntaxHighlighting(darkHighlight)] : [syntaxHighlighting(lightHighlight)]);
@@ -154,6 +187,7 @@ export function createEditor(parent, { onChange, onSelection }) {
 
   const extensions = () => [
     basicSetup,
+    phrasesC.of(phrases()),
     keymap.of([indentWithTab]),
     langC.of(lang(kind)),
     themeC.of(theme(dark)),
@@ -164,7 +198,7 @@ export function createEditor(parent, { onChange, onSelection }) {
     baseTheme,
     EditorState.tabSize.of(2),
     EditorView.updateListener.of((u) => {
-      if (u.docChanged) onChange?.(u);
+      if (u.docChanged && !u.transactions.some((tr) => tr.annotation(sampleTranslation))) onChange?.(u);
       if (u.selectionSet || u.docChanged) onSelection?.(u);
     }),
   ];
@@ -190,6 +224,27 @@ export function createEditor(parent, { onChange, onSelection }) {
       let b = 0;
       while (b < old.length - a && b < text.length - a && old[old.length - 1 - b] === text[text.length - 1 - b]) b++;
       view.dispatch({ changes: { from: a, to: old.length - b, insert: text.slice(a, text.length - b) } });
+    },
+    setLocale(value, sample) {
+      locale = value;
+      const line = view.dom.querySelector('.cm-goto-line input')?.value;
+      const changes = sample == null ? undefined : { from: 0, to: view.state.doc.length, insert: sample };
+      view.dispatch({
+        effects: phrasesC.reconfigure(phrases()),
+        changes,
+        annotations: [sampleTranslation.of(true), Transaction.addToHistory.of(false)],
+      });
+      if (line !== undefined) {
+        // Changing CodeMirror phrases rebuilds the view and closes its line dialog.
+        requestAnimationFrame(() => {
+          if (view.dom.querySelector('.cm-goto-line input')) return;
+          const focused = document.activeElement;
+          gotoLine(view);
+          const input = view.dom.querySelector('.cm-goto-line input');
+          if (input) input.value = line;
+          if (focused instanceof HTMLElement) focused.focus({ preventScroll: true });
+        });
+      }
     },
     setDark(d) { dark = d; view.dispatch({ effects: themeC.reconfigure(theme(d)) }); },
     setWrap(w) { wrap = w; view.dispatch({ effects: wrapC.reconfigure(w ? EditorView.lineWrapping : []) }); },

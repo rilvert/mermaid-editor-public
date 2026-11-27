@@ -1,6 +1,9 @@
 // Mermaid Editor – App
 import { createEditor } from './editor.js';
 import { createPreview } from './preview.js';
+import { createPdfExport } from './pdf.js';
+import { errorText, normalizeLocale, setLocale, t, translate } from './i18n.js';
+import { samples } from './samples.js';
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (s) => document.querySelector(s);
@@ -25,6 +28,7 @@ async function api(route, { method = 'GET', body, query } = {}) {
     return r || {};
   }
   const u = new URL('/api/' + route, location.origin);
+  u.searchParams.set('lang', state.locale);
   for (const [k, v] of Object.entries(query || {})) if (v != null) u.searchParams.set(k, v);
   const r = await fetch(u, {
     method,
@@ -53,17 +57,26 @@ const state = {
   view: store.get('view', 'split'),
   sidebar: store.get('sidebar', false),
   theme: store.get('theme', 'auto'),
+  locale: normalizeLocale(window.__mmeInitialLocale ?? store.get('locale')),
+  sample: null,
   files: [],
 };
 
+setLocale(state.locale);
+
 // ---------------------------------------------------------------- Toast/Status
 let toastTimer;
-function toast(msg) {
-  const t = $('#toast');
-  t.textContent = msg;
-  t.classList.add('show');
+let toastMessage;
+function toast(key, params) {
+  toastMessage = [key, params];
+  const el = $('#toast');
+  el.textContent = t(key, params);
+  el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  toastTimer = setTimeout(() => {
+    el.classList.remove('show');
+    toastMessage = null;
+  }, 2600);
 }
 
 function setStatus(text, cls = '') {
@@ -73,9 +86,9 @@ function setStatus(text, cls = '') {
 }
 
 function updateTitle() {
-  const name = state.path ? basename(state.path) : 'Unbenannt';
+  const name = state.path ? basename(state.path) : t('untitled');
   $('#file-name').textContent = name;
-  $('#file-name').title = state.path || 'Noch nicht gespeichert';
+  $('#file-name').title = state.path || t('unsaved');
   $('#file-dir').textContent = state.path ? dirname(state.path).replace(state.home, '~') : '';
   document.title = `${state.dirty ? '● ' : ''}${name} – Mermaid Editor`;
   document.body.classList.toggle('is-dirty', state.dirty);
@@ -95,10 +108,10 @@ function reportStatus() {
 
 function updateDirty() {
   state.dirty = editor.getText() !== state.saved;
-  if (state.conflict) setStatus('Konflikt', 'warn');
-  else if (state.saving) setStatus('Speichert …');
-  else if (state.dirty) setStatus(state.path ? (state.autosave ? 'Änderungen …' : 'Nicht gespeichert') : 'Nicht gespeichert', 'muted');
-  else setStatus(state.path ? 'Gespeichert' : '', 'ok');
+  if (state.conflict) setStatus(t('conflict'), 'warn');
+  else if (state.saving) setStatus(t('saving'));
+  else if (state.dirty) setStatus(t(state.path && state.autosave ? 'changes' : 'unsaved'), 'muted');
+  else setStatus(state.path ? t('saved') : '', 'ok');
   updateTitle();
 }
 
@@ -108,7 +121,9 @@ let syncTimer;
 let autoTimer;
 
 const editor = createEditor($('#editor'), {
+  locale: state.locale,
   onChange() {
+    state.sample = null;
     updateDirty();
     clearTimeout(previewTimer);
     previewTimer = setTimeout(() => preview.update(editor.getText()), 220);
@@ -134,18 +149,29 @@ const preview = createPreview($('#preview-pane'), $('#preview'), {
   toast,
   saveFile: NATIVE ? async (blob, name) => {
     const r = await api('export', { method: 'POST', body: { name, data: await toBase64(blob) } });
-    if (r.saved) toast('Gespeichert: ' + basename(r.path));
+    if (r.saved) toast('exported', { name: basename(r.path) });
   } : null,
   copyImage: NATIVE ? async (blob) => {
     await api('copyImage', { method: 'POST', body: { data: await toBase64(await blob) } });
-    toast('Diagramm als Bild kopiert');
+    toast('copied');
   } : null,
-  baseName: () => (state.path ? basename(state.path).replace(/\.[^.]+$/, '') : 'diagramm'),
+  baseName: () => (state.path ? basename(state.path).replace(/\.[^.]+$/, '') : t('diagramFile').toLowerCase()),
   assetUrl: (src) => {
     const dir = state.path ? dirname(state.path) : state.root || state.home;
     const abs = src.startsWith('/') ? src : `${dir}/${decodeURI(src)}`;
     return `/api/asset?token=${TOKEN}&path=${encodeURIComponent(abs)}`;
   },
+});
+
+const openPdfExport = createPdfExport({
+  preview,
+  getText: () => editor.getText(),
+  getName: () => (state.path ? basename(state.path).replace(/\.[^.]+$/, '') : '') || t('untitled'),
+  savePdf: NATIVE ? async (name) => {
+    const result = await api('export/pdf', { method: 'POST', body: { name: name + '.pdf' } });
+    if (result.saved) toast('exported', { name: basename(result.path) });
+  } : null,
+  toast,
 });
 
 function toBase64(blob) {
@@ -169,7 +195,10 @@ function setView(v) {
   const ws = $('#workspace');
   ws.classList.remove('view-code', 'view-split', 'view-preview');
   ws.classList.add('view-' + v);
-  document.querySelectorAll('#view-switch button').forEach((b) => b.classList.toggle('active', b.dataset.view === v));
+  document.querySelectorAll('#view-switch button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.view === v);
+    b.setAttribute('aria-pressed', String(b.dataset.view === v));
+  });
   requestAnimationFrame(() => {
     editor.view.requestMeasure();
     preview.refresh();
@@ -181,6 +210,7 @@ function setSidebar(on) {
   store.set('sidebar', on);
   $('#workspace').classList.toggle('with-sidebar', on);
   $('#btn-sidebar').classList.toggle('active', on);
+  $('#btn-sidebar').setAttribute('aria-expanded', String(on));
   if (on) loadFiles();
 }
 
@@ -191,7 +221,11 @@ function applyTheme() {
   editor.setDark(dark);
   preview.setDark(dark);
   renderNow();
-  document.querySelectorAll('[data-theme-opt]').forEach((b) => b.classList.toggle('checked', b.dataset.themeOpt === state.theme));
+  document.querySelectorAll('[data-theme-opt]').forEach((b) => {
+    const active = b.dataset.themeOpt === state.theme;
+    b.classList.toggle('checked', active);
+    b.setAttribute('aria-pressed', String(active));
+  });
   reportStatus();
 }
 darkMq.addEventListener('change', () => state.theme === 'auto' && applyTheme());
@@ -274,7 +308,7 @@ async function onExternalChange() {
     state.mtime = r.mtime;
     editor.replaceDoc(r.content);
     updateDirty();
-    toast('Datei wurde extern geändert – neu geladen');
+    toast('reloaded');
   } else {
     showConflict(r);
   }
@@ -301,16 +335,28 @@ function showConflict(disk) {
   };
 }
 
+function confirmDiscard() {
+  const dialog = $('#discard-dialog');
+  if (typeof dialog.showModal !== 'function') return Promise.resolve(confirm(t('discard')));
+  if (dialog.open) return Promise.resolve(false);
+  dialog.returnValue = '';
+  dialog.showModal();
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'discard'), { once: true });
+  });
+}
+
 async function openFile(path, { quiet = false } = {}) {
   if (state.dirty && state.path && !state.conflict) await save();
-  else if (state.dirty && !state.path && editor.getText().trim() && !confirm('Ungespeicherten Text verwerfen?')) return false;
+  else if (state.dirty && !state.path && editor.getText().trim() && !(await confirmDiscard())) return false;
   let r;
   try {
     r = await api('file', { query: { path } });
   } catch (e) {
-    if (!quiet) toast('Öffnen fehlgeschlagen: ' + e.message);
+    if (!quiet) toast('openFailed', { reason: () => errorText(e) });
     return false;
   }
+  state.sample = null;
   state.path = r.path;
   state.mtime = r.mtime;
   state.saved = r.content;
@@ -330,7 +376,7 @@ async function openFile(path, { quiet = false } = {}) {
   else markActiveFile();
   updateDirty();
   renderNow();
-  if (r.isNew) toast('Neue Datei – wird beim Speichern angelegt');
+  if (r.isNew) toast('newFile');
   return true;
 }
 
@@ -340,8 +386,9 @@ function newDoc() {
   state.mtime = 0;
   state.saved = '';
   state.kind = 'markdown';
+  state.sample = 'newDoc';
   preview.setKind('markdown');
-  editor.setDoc(SAMPLE_NEW, 'markdown');
+  editor.setDoc(samples[state.locale].newDoc, 'markdown');
   editor.setWrap(state.wrap);
   const u = new URL(location.href);
   u.searchParams.delete('file');
@@ -359,10 +406,10 @@ async function save({ as = false, force = false } = {}) {
   let path = state.path;
   if (!path || as) {
     if (dialogOpen) return;
-    const name = state.path ? basename(state.path) : 'Diagramm.md';
+    const name = state.path ? basename(state.path) : t('diagramFile') + '.md';
     dialogOpen = true;
     const r = await api('dialog/save', { method: 'POST', body: { dir: state.path ? dirname(state.path) : state.root || state.home, name } })
-      .catch((e) => { toast(e.message); return {}; })
+      .catch((e) => { toast('saveFailed', { reason: () => errorText(e) }); return {}; })
       .finally(() => { dialogOpen = false; });
     if (!r.path) return;
     path = r.path;
@@ -374,6 +421,7 @@ async function save({ as = false, force = false } = {}) {
     const sameFile = path === state.path;
     const r = await api('file', { method: 'PUT', body: { path, content, baseMtime: sameFile && !force ? state.mtime : 0, force } });
     const changedPath = path !== state.path;
+    state.sample = null;
     state.path = path;
     state.mtime = r.mtime;
     state.saved = content;
@@ -395,7 +443,7 @@ async function save({ as = false, force = false } = {}) {
     }
   } catch (e) {
     if (e.status === 409) showConflict(null);
-    else toast('Speichern fehlgeschlagen: ' + e.message);
+    else toast('saveFailed', { reason: () => errorText(e) });
   } finally {
     state.saving = false;
     updateDirty();
@@ -409,14 +457,16 @@ async function openDialog() {
   try {
     const r = await api('dialog/open', { method: 'POST', body: { dir: state.path ? dirname(state.path) : state.root } });
     if (r.path) openFile(r.path);
-  } catch (e) { toast(e.message); } finally { dialogOpen = false; }
+  } catch (e) { toast('openFailed', { reason: () => errorText(e) }); } finally { dialogOpen = false; }
 }
 
 async function folderDialog() {
   if (dialogOpen) return;
   dialogOpen = true;
-  const r = await api('dialog/folder', { method: 'POST', body: { dir: state.root } }).catch(() => ({})).finally(() => { dialogOpen = false; });
-  if (r.path) { setRoot(r.path); setSidebar(true); }
+  try {
+    const r = await api('dialog/folder', { method: 'POST', body: { dir: state.root } });
+    if (r.path) { setRoot(r.path); setSidebar(true); }
+  } catch (e) { toast('openFailed', { reason: () => errorText(e) }); } finally { dialogOpen = false; }
 }
 
 // ---------------------------------------------------------------- Seitenleiste
@@ -461,7 +511,12 @@ function renderFiles() {
     b.onclick = () => openFile(f.path);
     list.appendChild(b);
   }
-  if (!files.length) list.innerHTML = '<div class="empty">Keine .md / .mmd-Dateien</div>';
+  if (!files.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = t('noFiles');
+    list.appendChild(empty);
+  }
   markActiveFile();
 }
 
@@ -483,32 +538,80 @@ $('#zoom-out').onclick = () => preview.setZoom(preview.getZoom() / 1.2);
 $('#zoom-val').onclick = () => preview.setZoom(1);
 
 const menu = $('#menu');
-$('#btn-menu').onclick = (e) => {
+const menuButton = $('#btn-menu');
+function showMenu(open) {
+  menu.hidden = !open;
+  if (open) menu.scrollTop = 0;
+  menuButton.setAttribute('aria-expanded', String(open));
+}
+menuButton.onclick = (e) => {
   e.stopPropagation();
-  menu.hidden = !menu.hidden;
+  showMenu(menu.hidden);
 };
-document.addEventListener('click', (e) => { if (!menu.contains(e.target)) menu.hidden = true; });
+document.addEventListener('click', (e) => { if (!menu.contains(e.target)) showMenu(false); });
+menu.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    showMenu(false);
+    menuButton.focus();
+  }
+});
 menu.addEventListener('click', (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   const act = b.dataset.act;
   if (b.dataset.themeOpt) { state.theme = b.dataset.themeOpt; store.set('theme', state.theme); applyTheme(); return; }
-  menu.hidden = true;
+  if (b.dataset.locale) { changeLocale(b.dataset.locale, { notifyNative: true }); return; }
+  showMenu(false);
   if (act === 'new') newDoc();
   if (act === 'open') openDialog();
   if (act === 'folder') folderDialog();
   if (act === 'saveas') save({ as: true });
-  if (act === 'reveal' && state.path) api('reveal', { method: 'POST', body: { path: state.path } });
+  if (act === 'pdf') openPdfExport();
+  if (act === 'reveal') revealFile();
   if (act === 'autosave') { state.autosave = !state.autosave; store.set('autosave', state.autosave); syncMenu(); updateDirty(); if (state.autosave && state.dirty && state.path) save(); }
   if (act === 'wrap') { state.wrap = !state.wrap; store.set('wrap', state.wrap); editor.setWrap(state.wrap); syncMenu(); }
 });
+function revealFile() {
+  if (state.path) api('reveal', { method: 'POST', body: { path: state.path } }).catch((e) => {
+    toast('openFailed', { reason: () => errorText(e) });
+  });
+}
+
 function syncMenu() {
   menu.querySelector('[data-act="autosave"]').classList.toggle('checked', state.autosave);
   menu.querySelector('[data-act="wrap"]').classList.toggle('checked', state.wrap);
+  for (const b of menu.querySelectorAll('[data-locale]')) {
+    b.classList.toggle('checked', b.dataset.locale === state.locale);
+  }
+  for (const b of menu.querySelectorAll('.check')) {
+    b.setAttribute('aria-pressed', String(b.classList.contains('checked')));
+  }
+}
+
+function changeLocale(value, { notifyNative = false } = {}) {
+  const locale = normalizeLocale(value);
+  if (state.locale === locale) return;
+  state.locale = locale;
+  setLocale(locale);
+  if (!NATIVE) store.set('locale', locale);
+  else if (notifyNative) api('locale', { method: 'POST', body: { locale } }).catch(() => {});
+  translate(document);
+  const text = samples[locale][state.sample];
+  editor.setLocale(locale, text);
+  preview.setLocale();
+  if (state.sample) {
+    if (state.sample === 'welcome') state.saved = text;
+    renderNow();
+  }
+  if (state.sidebar) renderFiles();
+  syncMenu();
+  updateDirty();
+  if (toastMessage) $('#toast').textContent = t(...toastMessage);
 }
 
 // Tastenkürzel ausserhalb des Editors
 document.addEventListener('keydown', (e) => {
+  if ($('#discard-dialog').open || $('#pdf-dialog').open) return;
   const mod = e.metaKey || e.ctrlKey;
   if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save({ as: e.shiftKey }); }
   else if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openDialog(); }
@@ -519,7 +622,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('beforeunload', (e) => {
-  if (state.dirty && (state.path || editor.getText().trim())) {
+  if (state.dirty && !state.sample && (state.path || editor.getText().trim())) {
     if (state.path && state.autosave) save();
     e.preventDefault();
     e.returnValue = '';
@@ -527,61 +630,8 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 // ---------------------------------------------------------------- Start
-const SAMPLE_NEW = `# Neues Dokument
-
-\`\`\`mermaid
-sequenceDiagram
-  actor U as Benutzer
-  participant C as Client
-  participant S as Server
-  U->>C: Aktion
-  activate C
-  C->>S: Anfrage
-  S-->>C: Antwort
-  deactivate C
-\`\`\`
-`;
-
-const SAMPLE_WELCOME = `# Willkommen im Mermaid Editor
-
-Klicke im Diagramm auf ein Element – der Cursor springt zur passenden Zeile.
-Setze den Cursor in eine Zeile – das Element wird im Diagramm markiert.
-
-\`\`\`mermaid
----
-title: sd Beispiel
----
-sequenceDiagram
-  actor U as Benutzer
-  participant C as :Client
-  participant S as :Server
-  U-)C: Drucken / Sync
-  activate C
-  C->>C: Vorprüfung
-  alt Daten ok
-    C-)S: Übertrag prüfen
-    activate S
-    Note over S: Speichern
-    S--)C: Code 0
-    deactivate S
-  else Fehler
-    C-)U: Meldung
-  end
-  deactivate C
-\`\`\`
-
-\`\`\`mermaid
-flowchart LR
-  A[Start] --> B{Gültig?}
-  B -->|ja| C[Speichern]
-  B -->|nein| D[Fehler melden]
-  D --> A
-\`\`\`
-
-Öffnen: **⌘O** · Speichern: **⌘S** · Ansicht: **Ctrl+1 / 2 / 3**
-`;
-
 (async () => {
+  translate(document);
   setView(state.view);
   setSidebar(state.sidebar);
   syncMenu();
@@ -601,9 +651,11 @@ flowchart LR
   if (file && (await openFile(file, { quiet: true }))) return;
   if (isNew) { newDoc(); return; }
   const draft = store.get('draft', null);
-  editor.setDoc(draft || SAMPLE_WELCOME, 'markdown');
+  const text = draft || samples[state.locale].welcome;
+  state.sample = draft ? null : 'welcome';
+  editor.setDoc(text, 'markdown');
   editor.setWrap(state.wrap);
-  state.saved = draft ? '' : SAMPLE_WELCOME;
+  state.saved = draft ? '' : text;
   updateDirty();
   renderNow();
 })();
@@ -613,11 +665,13 @@ window.__mmeCommand = (name, arg) => {
   const c = {
     save: () => save(),
     saveas: () => save({ as: true }),
+    pdf: openPdfExport,
     open: () => openDialog(),
     openPath: () => openFile(arg),
     folder: () => folderDialog(),
     new: () => newDoc(),
-    reveal: () => state.path && api('reveal', { method: 'POST', body: { path: state.path } }),
+    reveal: revealFile,
+    locale: () => changeLocale(arg),
     'view:code': () => setView('code'),
     'view:split': () => setView('split'),
     'view:preview': () => setView('preview'),
@@ -636,8 +690,7 @@ window.__mmeFlush = async (saveAs) => {
   clearTimeout(autoTimer);
   if (!state.dirty) return { ok: true };
   if (!state.path && !saveAs) {
-    const text = editor.getText().trim();
-    if (!text || text === SAMPLE_NEW.trim() || text === SAMPLE_WELCOME.trim()) return { ok: true };
+    if (!editor.getText().trim() || state.sample) return { ok: true };
     return { ok: false, untitled: true };
   }
   await save({ as: saveAs && !state.path });

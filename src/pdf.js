@@ -161,7 +161,19 @@ function paginate(target, blocks, breaks) {
   return pages;
 }
 
-export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
+function blockAnchors(content, text) {
+  const lines = text.split(/\r\n?|\n/);
+  const counts = new Map();
+  return [...content.children].map((block) => {
+    const source = lines[Number(block.dataset.line)] ?? block.textContent;
+    const key = JSON.stringify([block.tagName, source.trim()]);
+    const occurrence = counts.get(key) ?? 0;
+    counts.set(key, occurrence + 1);
+    return key + ':' + occurrence;
+  });
+}
+
+export function createPdfExport({ preview, getText, getName, getSettingsKey, readSettings, writeSettings, savePdf, toast }) {
   const dialog = document.querySelector('#pdf-dialog');
   const output = document.querySelector('#pdf-document');
   const toc = dialog.querySelector('#pdf-toc');
@@ -180,12 +192,16 @@ export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
   let job;
   let printing = false;
   let drag;
+  let resizeFrame;
 
   function resizeSheets() {
     const zoom = Math.max(0.1, Math.min(1, (pagesEl.clientWidth - 22) / (210 * 96 / 25.4)));
     for (const sheet of pagesEl.querySelectorAll('.pdf-sheet')) sheet.style.zoom = zoom;
   }
-  new ResizeObserver(resizeSheets).observe(pagesEl);
+  new ResizeObserver(() => {
+    cancelAnimationFrame(resizeFrame);
+    resizeFrame = requestAnimationFrame(resizeSheets);
+  }).observe(pagesEl);
 
   function layout(current) {
     const scroll = pagesEl.scrollTop;
@@ -198,35 +214,52 @@ export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
     current.pages = pages;
     current.layoutContents = includeContents;
     reset.disabled = !current.breaks.size;
-    for (const [number, page] of pages.entries()) {
-      if (!number) continue;
-      const gap = document.createElement('div');
-      const first = page.start - shift;
-      gap.className = 'pdf-break';
-      const handle = document.createElement(page.continuation ? 'span' : 'button');
-      if (!page.continuation) {
-        handle.type = 'button';
-        handle.dataset.pdfHandle = first;
-      }
-      const message = page.continuation ? 'pdfContinued' : current.breaks.has(first) ? 'pdfManualBreak' : 'pdfAutoBreak';
-      handle.textContent = t(message, { page: number + 1 });
-      gap.append(handle);
-      page.sheet.before(gap);
-    }
     const seen = new Set();
-    for (const block of pagesEl.querySelectorAll('[data-pdf-block]')) {
-      const index = Number(block.dataset.pdfBlock) - shift;
-      block.dataset.pdfBlock = index;
-      if (index < Number(!includeContents) || seen.has(index)) continue;
-      seen.add(index);
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'pdf-add-break';
-      button.dataset.pdfAdd = index;
-      button.setAttribute('aria-label', t('pdfInsertBreak'));
-      button.title = t('pdfInsertBreak');
-      button.textContent = '+';
-      block.prepend(button);
+    for (const [number, page] of pages.entries()) {
+      const first = page.start - shift;
+      if (number) {
+        const manual = !page.continuation && current.breaks.has(first);
+        const gap = document.createElement('div');
+        gap.className = 'pdf-break';
+        gap.classList.toggle('pdf-break-manual', manual);
+        const handle = document.createElement(page.continuation ? 'span' : 'button');
+        if (!page.continuation) {
+          handle.type = 'button';
+          handle.dataset.pdfHandle = first;
+        }
+        const message = page.continuation ? 'pdfContinued' : manual ? 'pdfManualBreak' : 'pdfAutoBreak';
+        handle.textContent = t(message, { page: number + 1 });
+        gap.append(handle);
+        if (manual) {
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.dataset.pdfRemove = first;
+          remove.setAttribute('aria-label', t('pdfRemoveBreak', { page: number + 1 }));
+          remove.title = t('pdfRemoveBreak', { page: number + 1 });
+          remove.textContent = '×';
+          gap.append(remove);
+        }
+        page.sheet.before(gap);
+      }
+      const sheetTop = page.sheet.getBoundingClientRect().top;
+      const buttons = [];
+      for (const block of page.content.children) {
+        const index = Number(block.dataset.pdfBlock) - shift;
+        block.dataset.pdfBlock = index;
+        if (index < Number(!includeContents) || seen.has(index)) continue;
+        seen.add(index);
+        if (current.breaks.has(index)) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'pdf-add-break';
+        button.dataset.pdfAdd = index;
+        button.setAttribute('aria-label', t('pdfInsertBreak'));
+        button.title = t('pdfInsertBreak');
+        button.style.top = (block.getBoundingClientRect().top - sheetTop) + 'px';
+        button.textContent = '+';
+        buttons.push(button);
+      }
+      page.sheet.append(...buttons);
     }
     resizeSheets();
     pagesEl.scrollTop = scroll;
@@ -263,11 +296,23 @@ export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
     } catch (error) { report(error); }
   }
 
+  function saveSettings() {
+    writeSettings(job.settingsKey, {
+      contents: toc.checked,
+      breaks: [...job.breaks].map((index) => job.anchors[index]),
+    });
+  }
+
+  function updateBreaks() {
+    saveSettings();
+    layout(job);
+  }
+
   function moveBreak(from, to) {
-    if (from === to || to < Number(!toc.checked) || to >= job.blocks.length) return;
+    if (from === to || to < Number(!toc.checked) || to >= job.blocks.length || job.breaks.has(to)) return;
     job.breaks.delete(from);
     job.breaks.add(to);
-    layout(job);
+    updateBreaks();
     const handle = pagesEl.querySelector(`[data-pdf-handle="${to}"]`);
     handle?.focus({ preventScroll: true });
     handle?.scrollIntoView({ block: 'nearest' });
@@ -342,19 +387,30 @@ export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
     moveBreak(from, from + (event.key === 'ArrowUp' ? -1 : 1));
   });
   pagesEl.addEventListener('click', (event) => {
+    const remove = event.target.closest('[data-pdf-remove]');
+    if (remove) {
+      const index = Number(remove.dataset.pdfRemove);
+      job.breaks.delete(index);
+      updateBreaks();
+      pagesEl.querySelector(`[data-pdf-add="${index}"]`)?.focus();
+      return;
+    }
     const add = event.target.closest('[data-pdf-add]');
     if (!add) return;
     const index = Number(add.dataset.pdfAdd);
     job.breaks.add(index);
-    layout(job);
+    updateBreaks();
     pagesEl.querySelector(`[data-pdf-handle="${index}"]`)?.focus();
   });
-  reset.addEventListener('click', () => { job.breaks.clear(); layout(job); });
+  reset.addEventListener('click', () => { job.breaks.clear(); updateBreaks(); });
   showBreaks.addEventListener('change', () => {
     previewPanel.hidden = !showBreaks.checked;
     refresh();
   });
-  toc.addEventListener('change', refresh);
+  toc.addEventListener('change', () => {
+    saveSettings();
+    refresh();
+  });
 
   function dismiss() {
     job?.controller.abort();
@@ -442,12 +498,23 @@ export function createPdfExport({ preview, getText, getName, savePdf, toast }) {
 
   return function openPdfExport() {
     if (printing || dialog.open) return;
-    const { content, diagrams } = preview.renderDocument(getText());
-    job = { content, diagrams, name: getName(), breaks: new Set(), controller: new AbortController() };
-    toc.checked = false;
+    const text = getText();
+    const { content, diagrams } = preview.renderDocument(text);
+    const settingsKey = getSettingsKey();
+    const settings = readSettings(settingsKey);
+    const anchors = blockAnchors(content, text);
+    const savedBreaks = new Set(settings?.breaks ?? []);
+    const breaks = new Set();
+    for (const [index, anchor] of anchors.entries()) {
+      if (savedBreaks.has(anchor)) breaks.add(index);
+    }
+    job = { content, diagrams, name: getName(), settingsKey, anchors, breaks, controller: new AbortController() };
     toc.disabled = !content.querySelector('h1, h2, h3, h4, h5, h6');
-    showBreaks.checked = false;
-    previewPanel.hidden = true;
+    toc.checked = !toc.disabled && Boolean(settings?.contents);
+    reset.disabled = true;
+    showBreaks.checked = true;
+    previewPanel.hidden = false;
     dialog.showModal();
+    refresh();
   };
 }

@@ -163,10 +163,17 @@ const preview = createPreview($('#preview-pane'), $('#preview'), {
   },
 });
 
+function pdfSettingsKey() {
+  return state.path ? 'pdf.file.' + state.path : state.sample === 'welcome' ? 'pdf.welcome' : 'pdf.draft';
+}
+
 const openPdfExport = createPdfExport({
   preview,
   getText: () => editor.getText(),
   getName: () => (state.path ? basename(state.path).replace(/\.[^.]+$/, '') : '') || t('untitled'),
+  getSettingsKey: pdfSettingsKey,
+  readSettings: (key) => store.get(key),
+  writeSettings: (key, settings) => store.set(key, settings),
   savePdf: NATIVE ? async (name, markup) => {
     const result = await api('export/pdf', { method: 'POST', body: { name: name + '.pdf', markup } });
     if (result.saved) toast('exported', { name: basename(result.path) });
@@ -387,6 +394,7 @@ function newDoc() {
   state.saved = '';
   state.kind = 'markdown';
   state.sample = 'newDoc';
+  store.set('pdf.draft', null);
   preview.setKind('markdown');
   editor.setDoc(samples[state.locale].newDoc, 'markdown');
   editor.setWrap(state.wrap);
@@ -415,6 +423,7 @@ async function save({ as = false, force = false } = {}) {
     path = r.path;
   }
   const content = editor.getText();
+  const previousPdfKey = pdfSettingsKey();
   state.saving = true;
   updateDirty();
   try {
@@ -426,6 +435,7 @@ async function save({ as = false, force = false } = {}) {
     state.mtime = r.mtime;
     state.saved = content;
     if (changedPath) {
+      store.set(pdfSettingsKey(), store.get(previousPdfKey, null));
       store.set('lastFile', path);
       store.set('draft', null);
       const u = new URL(location.href);
